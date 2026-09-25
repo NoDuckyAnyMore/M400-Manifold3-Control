@@ -1,0 +1,15 @@
+# Local DJI application credentials (kept on the developer machine only)
+/samples/sample_c++/platform/linux/manifold3/application/dji_sdk_app_info.h
+/samples/sample_c/platform/linux/manifold3/app_json/app.json
+
+# Build output, DPKs, route outputs and local flight data
+/build-manifold3/
+/build-manifold3-ui/
+/tools/waypoint_output/
+/tools/m400_scan_region.mat
+*.dpk
+*.kmz
+*.csv
+*.log
+.env
+.env.*

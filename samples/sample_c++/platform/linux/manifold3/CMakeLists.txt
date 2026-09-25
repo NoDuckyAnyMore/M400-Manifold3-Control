@@ -1,11 +1,9 @@
 cmake_minimum_required(VERSION 3.5)
-project(dji_sdk_demo_on_manifold3_cxx CXX)
+project(dji_sdk_demo_on_manifold3_cxx LANGUAGES CXX C)
 
-set(CMAKE_C_FLAGS "-pthread -std=gnu99")
-set(CMAKE_CXX_FLAGS "-std=c++11 -pthread")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -pthread -std=gnu99")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11 -pthread")
 set(CMAKE_EXE_LINKER_FLAGS "-pthread")
-set(CMAKE_C_COMPILER "aarch64-linux-gnu-gcc")
-set(CMAKE_CXX_COMPILER "aarch64-linux-gnu-g++")
 add_definitions(-D_GNU_SOURCE)
 
 if (BUILD_TEST_CASES_ON MATCHES TRUE)
@@ -72,7 +70,7 @@ if (BUILD_CROSS_COMPILE MATCHES TRUE)
         message(STATUS "Did not find OpenCV in the system, image data is inside RecvContainer as raw data")
     endif ()
 
-    find_package(FFMPEG REQUIRED)
+    find_package(FFMPEG QUIET)
     if (FFMPEG_FOUND)
         message(STATUS "Found FFMPEG installed in the system")
         message(STATUS " - Includes: ${FFMPEG_INCLUDE_DIR}")

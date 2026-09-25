@@ -1,0 +1,28 @@
+{
+    "user_app_id": "",
+    "firmware_version": "01.03.00.00",
+    "is_ai_rendering": "false",
+    "platform": "manifold3",
+    "name": {
+        "name_cn": "M400控制测试",
+        "name_en": "m400-control-test",
+        "name_jp": "M400 Control Test",
+        "name_fr": "M400 Control Test"
+    },
+    "description": {
+        "description_cn": ["Matrice 400 妙算3飞行数据采集和控制测试应用"],
+        "description_en": ["Matrice 400 Manifold 3 flight-data collection and control test application"],
+        "description_jp": ["Matrice 400 Manifold 3 control test application"],
+        "description_fr": ["Application de test Manifold 3 pour Matrice 400"]
+    },
+    "maintainer": {
+        "maintainer_cn": "M400控制测试开发者",
+        "maintainer_en": "M400 Control Test Developer",
+        "maintainer_jp": "M400 Control Test Developer",
+        "maintainer_fr": "M400 Control Test Developer"
+    },
+    "ver_min": "00.00.00.00",
+    "ver_max": "99.99.99.99",
+    "bin": "../../../../../../build-manifold3/bin/dji_sdk_demo_on_manifold3_cxx",
+    "userconfig": ["widget"]
+}
