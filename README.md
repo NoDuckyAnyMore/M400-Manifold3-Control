@@ -1,5 +1,7 @@
 # M400 控制测试｜妙算 3
 
+## 项目简介
+
 基于 DJI Payload SDK 3.16.0 的 Matrice 400＋妙算 3 实验项目：通过 DJI Pilot 采集飞行数据、查看状态并测试位置/航向控制。本仓库是本地开发副本，不是 DJI 官方示例原仓库。
 
 > 当前版本 **1.3**（DPK 格式 `01.03.00.00`），已在妙算 3 原生编译、安装并启动。此前版 Pilot 控件顺序已现场确认；1.3 的 Pilot 界面和新版飞行动作尚未现场复核。
@@ -10,7 +12,10 @@
 | --- | --- |
 | 平台 | M400＋妙算 3；E3 地址 `192.168.42.140`；妙算 Ubuntu 20.04 / ARM64 / GCC 9.4 |
 | 应用 | `m400-control-test`；Payload SDK-妙算 3；PSDK 3.16.0；App ID 仅保存在本机配置 |
-| SSH | `dji@192.168.42.140`；默认用户名和密码均为 `dji`；本机也已配置密钥 |
+| 树莓派 SSH（电脑同 Wi-Fi） | `ssh pi4@192.168.124.14` |
+| 妙算 SSH（E3 调参链路） | `ssh dji@192.168.42.140` |
+| 妙算 SSH（经树莓派跳板） | `ssh -J pi4@192.168.124.14 dji@10.88.77.54` |
+| 妙算登录账号 | 默认用户名和密码均为 `dji`；本机也已配置密钥 |
 | 版本 | 默认保持 1.3，**改代码不自动升版本**；明确改版本时同步 `app.json` 和程序的 `firmwareVersion` |
 
 App ID、App Key 和高级 License 只保存在本机的 `dji_sdk_app_info.h`、`app.json` 中；这两个文件不提交。新克隆时分别复制 [头文件模板](samples/sample_c++/platform/linux/manifold3/application/dji_sdk_app_info.example.h) 和 [DPK 模板](samples/sample_c/platform/linux/manifold3/app_json/app.example.json)，填写自己的应用信息。Widget JSON 的 `version: 1.0` 是界面配置版本，不随 DPK 改。SDK 文档提示应用更新时应更新版本；若同版本安装被拒绝，先查错，不擅自递增。本仓库基于 [DJI 官方 Payload-SDK](https://github.com/dji-sdk/Payload-SDK) 的 fork，保留原始 [LICENSE.txt](LICENSE.txt) 和 [EULA.txt](EULA.txt)；公开或再分发时应自行核对许可义务。
@@ -103,6 +108,48 @@ dji_app_ctl list m400-control-test
 ```powershell
 scp -i $key dji@192.168.42.140:/home/dji/m400-dpk-current/m400-control-test_v01.03.00.00.dpk 'D:\M400-Manifold3-Control\build-manifold3\dpk\'
 ```
+
+## 联合开发网络（树莓派 Wi-Fi → 妙算 3）
+
+树莓派 4B 通过 Wi-Fi 上网，并用网口直连妙算 3 扩展坞网口；树莓派的 [NetworkManager `shared` 模式](https://networkmanager.dev/docs/api/latest/nm-settings-nmcli.html)负责给妙算分配地址、DNS 和 NAT。**不依赖 M400 内部网络转发，也不需要额外 AP。**这是两个独立网段，妙算并未直接加入 Wi-Fi：
+
+```text
+电脑 ── Wi-Fi 192.168.124.0/24 ── 树莓派 wlan0 192.168.124.14
+                                  树莓派 eth0 10.88.77.1 ── 网线 ── 妙算 eth0 10.88.77.54
+                                                       妙算 E3 调参地址 192.168.42.140
+```
+
+以上是 2026-09-27 的实测地址；两机重启一次后地址未变，但 `192.168.124.14` 和 `10.88.77.54` 都是 DHCP 地址，后续仍可能变化。`192.168.42.140` 只用于电脑连接飞机调参链路时访问妙算。
+
+电脑 PowerShell 登录树莓派、经树莓派跳板登录妙算（跳板连接已由用户验证）：
+
+```powershell
+ssh pi4@192.168.124.14
+ssh -J pi4@192.168.124.14 dji@10.88.77.54
+```
+
+首次配置树莓派（`m3-share` **只创建一次**；已存在时只需 `sudo nmcli connection up m3-share`）：
+
+```bash
+ip route get 1.1.1.1  # 须显示 dev wlan0、src 192.168.124.14；否则先确认 Wi-Fi 出口
+sudo nmcli connection add type ethernet ifname eth0 con-name m3-share \
+  ipv4.method shared ipv4.addresses 10.88.77.1/24 ipv6.method disabled
+sudo nmcli connection up m3-share
+ip -4 -br addr show eth0  # 预期 10.88.77.1/24
+```
+
+妙算扩展坞网口当前为 `eth0`。初次配置或未拿到地址时使用 [DJI `netctl.sh`](https://developer.dji.com/doc/payload-sdk-tutorial/cn/manifold-quick-start/manifold-platform-capabilities/system-tools.html)：
+
+```bash
+sudo /system/bin/netctl.sh setup_dhcp_ip --type eth --iface eth0
+sudo /system/bin/netctl.sh setup_route --route "default>eth" --iface eth:eth0
+ip -4 -br addr show eth0  # 当前为 10.88.77.54/24
+ping -c 3 10.88.77.1  # 树莓派网口
+ping -c 3 1.1.1.1     # 外网；失败时先在树莓派检查 Wi-Fi 出口
+getent hosts baidu.com # DNS
+```
+
+从树莓派本机访问妙算：`ssh dji@10.88.77.54`。网线重插后会自动重连，但原 SSH/数据流会中断，妙算地址也可能改变。拔掉网线时，树莓派 Wi-Fi 和本地采集不受影响；妙算失去通过树莓派的网络出口，E3/PSDK 链路不依赖此线。当前妙算的以太网默认路由优先于机身网络；以太网断开后可能回退到机身默认路由，**不保证仍能上网**。配置保留、重启后自动恢复已实测一次；若树莓派 Wi-Fi 断开但网线仍连着，妙算也无法经树莓派上网。
 
 ## 踩坑总结
 
