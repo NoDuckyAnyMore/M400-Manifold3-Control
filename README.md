@@ -41,6 +41,7 @@ App ID、App Key 和高级 License 只保存在本机的 `dji_sdk_app_info.h`、
 
 - 以 50 Hz 记录飞行状态、融合位置、RTK、速度、姿态等 CSV；默认关闭，Pilot 可开始/停止。Payload 设置页可浏览最近 CSV 的日期和时间；同秒文件名自动加 `_01` 等后缀防覆盖。
 - 主界面保留开始录制、停止录制、红色紧急悬停三个快捷按钮及浮窗入口。浮窗每秒刷新录制、RTK、经纬度和最近控制结果；Payload 设置页另有录制开关、状态与运动按钮。
+- 妙算 3 的 `eth0` 监听 Pi4 发来的一行 TCP 文本，在 Pilot 浮窗显示 `PI4:<原文>`；Pilot 按钮按下、录制开关切换和 CSV 选择事件同时转发给 Pi4。这条链路不解析 Pi4 文本或执行其中的控制指令。
 - 运动测试：前后左右各 1 m、上下各 1 m、前进 5 m、左右旋转各 90°，以及分步定点 F2/F10、官方例程风格定点 F2。固定点按钮须在 10 秒内连续按**同一个**两次，初始目标距离限 100 m。
 - 固定测试点为 `22.602549522388877, 113.99172104792952`，目标高度是**起飞点以上 20 m**，不是海拔或实时离地高度。本项目是 PSDK joystick 闭环试验，**不是** Waypoint/FlyTo 航线任务，也不承诺自动避障。
 
@@ -53,6 +54,24 @@ App ID、App Key 和高级 License 只保存在本机的 `dji_sdk_app_info.h`、
 | 官方例程风格 F2 | 位置 / 位置 / 角度 | 水平、高度、目标航向同时给指令；水平每轴偏移上限 2 m |
 
 这里的 `speedFactor` 是**水平位置偏移指令的每轴米数上限**，不是 m/s，也不限制飞控内部加速度。F10 可能更激进；若两轴剩余误差都不超过 2 m，F2/F10 的水平指令可能相同。
+
+## Pi4 ↔ 妙算 3 文本通讯验证
+
+DPK 内的 TCP 服务由 [m400_pi4_bridge.c](samples/sample_c/module_sample/m400_control/m400_pi4_bridge.c) 实现。它只绑定妙算 `eth0` 当前的 IPv4 地址，监听端口 `14560`，只接收来自 Pi4 网口 `10.88.77.1` 的连接。`eth0` 尚未拿到地址时会每 2 秒重试；地址变更后会重新绑定。单条 UTF-8 文本最多 240 字节，浮窗每秒刷新并显示最近一条 `PI4:` 消息。此接口只展示 Pi4 文本，不把文本解释为控制指令。
+
+将 [Pi4 双向终端脚本](tools/pi4_console.py) 复制到 Pi4，并在 Pi4 终端运行：
+
+```bash
+python3 pi4_console.py 10.88.77.54
+```
+
+终端上方实时显示妙算发来的 Pilot 控件事件和两机时差，下方为 `send to m3:` 输入行；输入 `你好，妙算3` 并按回车后，Pilot 浮窗应显示 `PI4:你好，妙算3`，Pi4 上方也会显示 `M3 确认: OK`。按 `Ctrl+C` 退出。`10.88.77.54` 是此前记录的妙算 `eth0` DHCP 地址，变化时先在妙算运行 `ip -4 -br addr show eth0` 核对。若连接失败，确认 Pi4 `eth0` 为 `10.88.77.1`、网线已连通，并在妙算日志中查找 `Pi4 TCP listener ready`。
+
+**时间同步默认关闭**，此时仍会测量并显示 `Pi4 时差`、往返延迟和 M3 的 UTC 时间，不修改 Pi4 时钟。要启用实际校时，在 Pi4 上运行 `sudo python3 pi4_console.py 10.88.77.54 --sync-time`；运行中可按 `Ctrl+T` 开关校时，用于对比开关前后的测量值。调整系统时间需要 root 或 `CAP_SYS_TIME`；权限不足时程序会报告失败并关闭校时，收发消息仍可继续。建议先在妙算上用 `date -u` 确认其系统时间可信，再启用 Pi4 校时。
+
+妙算在建立订阅后及之后约每 10 秒发送 `TIME_POLL`。Pi4 连续取 3 次时间样本，使用往返延迟最小的一次，并按 [RFC 5905 的四时间戳时差和延迟公式](https://www.rfc-editor.org/rfc/rfc5905.html)计算 M3 相对 Pi4 的时差；开启校时时，对 1 ms 以上且往返延迟不超过 200 ms 的时差使用 Python 的 [`clock_settime_ns(CLOCK_REALTIME)`](https://docs.python.org/3/library/time.html#time.clock_settime_ns) 调整 Pi4 系统时间。下一轮样本可用于查看调整后的剩余时差。这是基于同一条 TCP 连接的 NTP 式测量与校时，**不实现标准 NTP 网络协议**。
+
+脚本在**一条 TCP 连接上全双工**运行：先发送 `SUBSCRIBE_BUTTONS`，此后 Pi4 文本以 `TEXT\t<内容>\n` 发往妙算，妙算回 `ACK\tOK` 或 `ACK\tERR ...`，同时随时推送控件事件和时间取样提示。Pi4 断线会自动重连。每次在 Pilot 按下按钮，Pi4 会看到例如 `BUTTON  8  forward_1m  PRESS_DOWN`。此处转发的是按下事件，不代表飞行动作已经成功；松开按钮不重复发送。当前 15 个按钮均覆盖，包括主界面的录制和紧急悬停按钮。录制开关另发 `SWITCH  2  record_switch  ON/OFF`，CSV 文件选择另发 `LIST  20  csv_select  <序号>`。底层事件以制表符分隔 `类型、widget_index、固定名称、状态` 四字段，末尾换行；空闲时约每 2 秒发送 `PING` 用于检测断线，脚本会忽略。只允许一个 Pi4 订阅连接，断线期间的事件不补发。
 
 ## 关键 API
 
@@ -79,6 +98,8 @@ App ID、App Key 和高级 License 只保存在本机的 `dji_sdk_app_info.h`、
 Set-Location 'D:\M400-Manifold3-Control'
 $key = 'C:\Users\Ducky\.ssh\codex_manifold3_ed25519'
 scp -i $key 'samples/sample_c/module_sample/m400_control/m400_control_service.c' dji@192.168.42.140:/home/dji/m400-src-v07/samples/sample_c/module_sample/m400_control/
+scp -i $key 'samples/sample_c/module_sample/m400_control/m400_pi4_bridge.c' dji@192.168.42.140:/home/dji/m400-src-v07/samples/sample_c/module_sample/m400_control/
+scp -i $key 'samples/sample_c/module_sample/m400_control/m400_pi4_bridge.h' dji@192.168.42.140:/home/dji/m400-src-v07/samples/sample_c/module_sample/m400_control/
 scp -i $key 'samples/sample_c/platform/linux/manifold3/app_json/widget/cn_big_screen/widget_config.json' dji@192.168.42.140:/home/dji/m400-src-v07/samples/sample_c/platform/linux/manifold3/app_json/widget/cn_big_screen/
 scp -i $key 'samples/sample_c/platform/linux/manifold3/app_json/widget/en_big_screen/widget_config.json' dji@192.168.42.140:/home/dji/m400-src-v07/samples/sample_c/platform/linux/manifold3/app_json/widget/en_big_screen/
 scp -i $key 'samples/sample_c/platform/linux/manifold3/app_json/app.json' dji@192.168.42.140:/home/dji/m400-src-v07/samples/sample_c/platform/linux/manifold3/app_json/

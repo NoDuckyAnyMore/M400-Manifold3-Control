@@ -4,6 +4,7 @@
  */
 
 #include "m400_control_service.h"
+#include "m400_pi4_bridge.h"
 
 #include <dji_fc_subscription.h>
 #include <dji_flight_controller.h>
@@ -26,6 +27,9 @@
 #include <unistd.h>
 
 #define M400_LOG_DIRECTORY                 "data/logs"
+#define M400_PI4_LISTEN_INTERFACE           "eth0"
+#define M400_PI4_ALLOWED_PEER               "10.88.77.1"
+#define M400_PI4_LISTEN_PORT                14560
 #define M400_WIDGET_EN_DIRECTORY           "widget/en_big_screen"
 #define M400_WIDGET_CN_DIRECTORY           "widget/cn_big_screen"
 #define M400_LOG_FREQUENCY_HZ              50
@@ -85,6 +89,26 @@ enum {
     M400_WIDGET_CSV_SELECT = 20,
     M400_WIDGET_CSV_DATE = 21,
     M400_WIDGET_CSV_TIME = 22,
+};
+
+static const char *const s_widgetEventNames[M400_WIDGET_COUNT] = {
+    [M400_WIDGET_START_RECORD] = "start_record",
+    [M400_WIDGET_STOP_RECORD] = "stop_record",
+    [M400_WIDGET_RECORD_SWITCH] = "record_switch",
+    [M400_WIDGET_EMERGENCY_HOVER] = "emergency_hover",
+    [M400_WIDGET_FORWARD_1M] = "forward_1m",
+    [M400_WIDGET_BACKWARD_1M] = "backward_1m",
+    [M400_WIDGET_LEFT_1M] = "left_1m",
+    [M400_WIDGET_RIGHT_1M] = "right_1m",
+    [M400_WIDGET_UP_1M] = "up_1m",
+    [M400_WIDGET_DOWN_1M] = "down_1m",
+    [M400_WIDGET_FORWARD_5M] = "forward_5m",
+    [M400_WIDGET_YAW_LEFT] = "yaw_left",
+    [M400_WIDGET_YAW_RIGHT] = "yaw_right",
+    [M400_WIDGET_GOTO_STAGED_2] = "goto_staged_f2",
+    [M400_WIDGET_GOTO_STAGED_10] = "goto_staged_f10",
+    [M400_WIDGET_GOTO_OFFICIAL_2] = "goto_official_f2",
+    [M400_WIDGET_CSV_SELECT] = "csv_select",
 };
 
 typedef enum {
@@ -153,6 +177,7 @@ static char s_csvFiles[M400_MAX_CSV_FILES][M400_FILENAME_LENGTH];
 static size_t s_csvFileCount = 0;
 static size_t s_selectedCsvIndex = 0;
 static char s_lastResult[M400_RESULT_LENGTH] = "Ready";
+static char s_pi4Message[M400_PI4_MESSAGE_MAX_BYTES + 1] = "";
 static int32_t s_widgetValues[M400_WIDGET_COUNT] = {0};
 static uint64_t s_buttonFeedbackUntilMs[M400_WIDGET_COUNT] = {0};
 static E_M400CommandState s_commandState = M400_COMMAND_STATE_IDLE;
@@ -165,6 +190,14 @@ static void *M400ControlTask(void *arg);
 static T_DjiReturnCode M400WidgetSetValue(E_DjiWidgetType widgetType, uint32_t index, int32_t value, void *userData);
 static T_DjiReturnCode M400WidgetGetValue(E_DjiWidgetType widgetType, uint32_t index, int32_t *value, void *userData);
 static float M400CurrentYawDegree(const T_DjiFcSubscriptionQuaternion *q);
+
+static void M400OnPi4Message(const char *message)
+{
+    pthread_mutex_lock(&s_stateMutex);
+    snprintf(s_pi4Message, sizeof(s_pi4Message), "%s", message);
+    pthread_mutex_unlock(&s_stateMutex);
+    USER_LOG_INFO("Pi4 TCP message received (%zu bytes)", strlen(message));
+}
 
 static const T_DjiWidgetHandlerListItem s_widgetHandlers[] = {
     {M400_WIDGET_START_RECORD, DJI_WIDGET_TYPE_BUTTON, M400WidgetSetValue, M400WidgetGetValue, NULL},
@@ -491,6 +524,7 @@ static void *M400StatusTask(void *arg)
     while (true) {
         char message[DJI_WIDGET_FLOATING_WINDOW_MSG_MAX_LEN];
         char result[M400_RESULT_LENGTH];
+        char pi4Message[sizeof(s_pi4Message)];
         T_M400Telemetry telemetry;
         bool recording;
 
@@ -498,6 +532,7 @@ static void *M400StatusTask(void *arg)
         telemetry = s_telemetry;
         recording = s_recording;
         snprintf(result, sizeof(result), "%s", s_lastResult);
+        snprintf(pi4Message, sizeof(pi4Message), "%s", s_pi4Message);
         pthread_mutex_unlock(&s_stateMutex);
 
         double longitude = NAN;
@@ -513,10 +548,20 @@ static void *M400StatusTask(void *arg)
             positionSource = "FUSED";
         }
 
-        snprintf(message, sizeof(message),
-                 "REC:%s RTK:%s POS:%s\r\nLon:%.7f Lat:%.7f\r\nCMD:%s",
-                 recording ? "ON" : "OFF", M400RtkStatusText(&telemetry), positionSource,
-                 longitude, latitude, result);
+        if (pi4Message[0] != '\0') {
+            int written = snprintf(message, sizeof(message),
+                                   "REC:%s RTK:%s POS:%s\r\nLon:%.7f Lat:%.7f\r\nCMD:%s\r\nPI4:%s",
+                                   recording ? "ON" : "OFF", M400RtkStatusText(&telemetry), positionSource,
+                                   longitude, latitude, result, pi4Message);
+            if (written < 0 || (size_t) written >= sizeof(message)) {
+                snprintf(message, sizeof(message), "PI4:%s", pi4Message);
+            }
+        } else {
+            snprintf(message, sizeof(message),
+                     "REC:%s RTK:%s POS:%s\r\nLon:%.7f Lat:%.7f\r\nCMD:%s",
+                     recording ? "ON" : "OFF", M400RtkStatusText(&telemetry), positionSource,
+                     longitude, latitude, result);
+        }
         T_DjiReturnCode rc = DjiWidgetFloatingWindow_ShowMessage(message);
         if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
             USER_LOG_WARN("Update widget status failed: 0x%08llX", (unsigned long long) rc);
@@ -1551,10 +1596,18 @@ static T_DjiReturnCode M400WidgetSetValue(E_DjiWidgetType widgetType, uint32_t i
         return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
     }
     if (widgetType == DJI_WIDGET_TYPE_BUTTON) {
+        M400Pi4Bridge_PublishEvent("BUTTON", index, s_widgetEventNames[index], "PRESS_DOWN");
         pthread_mutex_lock(&s_stateMutex);
         s_buttonFeedbackUntilMs[index] = M400GetMonotonicMs() +
                                          (index == M400_WIDGET_EMERGENCY_HOVER ? 2500ULL : 1000ULL);
         pthread_mutex_unlock(&s_stateMutex);
+    } else if (widgetType == DJI_WIDGET_TYPE_SWITCH && index == M400_WIDGET_RECORD_SWITCH) {
+        M400Pi4Bridge_PublishEvent("SWITCH", index, s_widgetEventNames[index],
+                                   value == DJI_WIDGET_SWITCH_STATE_ON ? "ON" : "OFF");
+    } else if (widgetType == DJI_WIDGET_TYPE_LIST && index == M400_WIDGET_CSV_SELECT) {
+        char selectedIndex[16];
+        snprintf(selectedIndex, sizeof(selectedIndex), "%d", value);
+        M400Pi4Bridge_PublishEvent("LIST", index, s_widgetEventNames[index], selectedIndex);
     }
 
     switch (index) {
@@ -1709,8 +1762,14 @@ T_DjiReturnCode M400Control_StartService(void)
         DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) return DJI_ERROR_SYSTEM_MODULE_CODE_UNKNOWN;
     if (osal->TaskCreate("m400_control", M400ControlTask, 4096, NULL, &controlTask) !=
         DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) return DJI_ERROR_SYSTEM_MODULE_CODE_UNKNOWN;
+    if (M400Pi4Bridge_Start(M400_PI4_LISTEN_INTERFACE, M400_PI4_ALLOWED_PEER,
+                            M400_PI4_LISTEN_PORT, M400OnPi4Message) != 0) {
+        USER_LOG_ERROR("Start Pi4 TCP listener failed");
+        return DJI_ERROR_SYSTEM_MODULE_CODE_UNKNOWN;
+    }
 
     s_serviceStarted = true;
-    USER_LOG_INFO("M400 control service started. Recording is OFF until requested from DJI Pilot.");
+    USER_LOG_INFO("M400 control service started. Pi4 TCP configured on port %d, %s; recording OFF.",
+                  M400_PI4_LISTEN_PORT, M400_PI4_LISTEN_INTERFACE);
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
