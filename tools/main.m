@@ -6,9 +6,9 @@ addpath(toolDir);
 
 % ======================== 常改参数 ========================
 cfg = struct;
-cfg.heightsM = [40 50 60];       % 示例：依次扫描的高度层，米；按任务修改
+cfg.heightsM = [50 60 70];       % 示例：依次扫描的高度层，米；按任务修改
 cfg.scanSpacingM = 10;           % 相邻扫描线间距，米
-cfg.directionDeg = 0;           % 扫描方向：0=南北，90=东西，顺时针自北
+cfg.directionDeg = 45;           % 扫描方向：0=南北，90=东西，顺时针自北
 cfg.flightSpeedMps = 5;         % 扫描飞行速度，m/s；与过渡速度分开
 
 cfg.updateRegion = false;       % 只有想重新在地图上点选区域时，才改为 true
