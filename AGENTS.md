@@ -122,4 +122,12 @@ ping -c 3 10.88.77.1
 - 遥控器暂停会收回 PSDK Joystick 控制权。控制程序订阅授权切换事件并退出当前循环；再次点按钮需重新申请控制权，飞控若拒绝不能靠软件强制抢回。历史版本未订阅此事件，暂停后可能长时间显示 `controller busy`。官方例程风格定点 F2 因实飞过于突兀已从本项目应用逻辑移除；上游 PSDK 示例保留。
 - 2026-09-28 用户实飞反馈：自定义水平与旋转动作平稳；F10 比 F2 快，但侧风下终点纠偏会导致航迹不直。现有 Joystick 位置控制只追终点，严格直线需横向误差反馈与实飞整定；WPML 航线的 `useStraightLine=1` 也只是尽量贴线。旧低高度航线已能启动并飞向首航点，但未完整执行，不能据此确认新停转动作的 M400 兼容性。
 
+## 待决定的 TODO（不要主动执行）
+
+以下仅用于提醒；须用户日后明确指定才开始，不因读到本清单就连接设备、清理文件、修改功能或安装依赖。
+
+- [ ] 清理 M3 上历史 `v*` 临时源码、缓存和 DPK；先核对实际用途与数据，再决定删除范围。今后源码暂存目录统一使用以 `Temp` 结尾的名称。M3 当前已断电，留待下次开机后处理。
+- [ ] 打通 Pi4 ↔ M3 的控制与数据传输：在 Pilot 的 PSDK 设置中控制 Pi4 开始／停止 B210 RSS 录制；结束后经以太网传到 `media` 文件夹。届时再确定文件格式、目标目录及断线重传方式。
+- [ ] 将 M400 机身 LiDAR 的 PSDK 订阅数据桥接到 ROS 2 `PointCloud2` topic，并选型、验证适合 M3 的 SLAM 建图项目。
+
 参考：[DJI 妙算运行例程](https://developer.dji.com/doc/payload-sdk-tutorial/cn/manifold-quick-start/run-sample-code.html) · [DJI 妙算网络工具](https://developer.dji.com/doc/payload-sdk-tutorial/cn/manifold-quick-start/manifold-platform-capabilities/system-tools.html) · [DJI 飞控接口](https://developer.dji.com/doc/payload-sdk-tutorial/cn/function-overview/advanced-function/flight-control.html)
