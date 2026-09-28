@@ -6,7 +6,7 @@ addpath(toolDir);
 
 % ======================== 常改参数 ========================
 cfg = struct;
-cfg.heightsM = [50 60 70];       % 示例：依次扫描的高度层，米；按任务修改
+cfg.heightsM = [55 60 65];       % 示例：依次扫描的高度层，米；按任务修改
 cfg.scanSpacingM = 10;           % 相邻扫描线间距，米
 cfg.directionDeg = 45;           % 扫描方向：0=南北，90=东西，顺时针自北
 cfg.flightSpeedMps = 5;         % 扫描飞行速度，m/s；与过渡速度分开

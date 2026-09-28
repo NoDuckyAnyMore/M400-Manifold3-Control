@@ -7,7 +7,8 @@
 - 唯一编辑目录：`D:\M400-Manifold3-Control`；不要回到旧的 `D:\Payload-SDK-Rndis-Simplify-Manifold3` 或临时 public/upstream 副本改项目。
 - 改代码默认保持应用版本 **1.4**（DPK `01.04.00.00`），只有用户明确要求才改版本；若改版本，同步本机 `app.json` 和 `application.cpp` 的 `firmwareVersion`。Widget JSON 的 `version: 1.0` 是独立配置版本。
 - App ID、App Key、高级 License 只保存在未跟踪的 `samples/sample_c++/platform/linux/manifold3/application/dji_sdk_app_info.h` 与 `samples/sample_c/platform/linux/manifold3/app_json/app.json`。公开前检查 `git status`、暂存差异，不能提交凭据、DPK 或飞行 CSV。
-- 修改和部署分开：除非用户明确要求，不自动传输、编译、安装、启动、提交或推送。用户在 `tools/main_scan.m`、`tools/main_scan_rotate.m` 等文件中的现有修改应保留。
+- 本项目工作区内的源码、脚本和文档修改（包括任务开始前已有的修改）均视为用户认可。完成项目修改后可直接本地提交；用户要求提交或推送时，默认把项目内所有这类修改一起提交，不再因其并非本轮改动而排除，也无需逐项确认。提交前仍须排除凭据、DPK、飞行 CSV 等敏感或生成文件。
+- 修改和部署分开：除非用户明确要求，不自动传输、编译、安装、启动或推送到远端。本地提交不等于远端推送。
 
 | 内容 | 位置 |
 | --- | --- |
