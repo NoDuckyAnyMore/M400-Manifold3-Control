@@ -525,43 +525,38 @@ static void *M400StatusTask(void *arg)
         char message[DJI_WIDGET_FLOATING_WINDOW_MSG_MAX_LEN];
         char result[M400_RESULT_LENGTH];
         char pi4Message[sizeof(s_pi4Message)];
-        T_M400Telemetry telemetry;
-        bool recording;
 
         pthread_mutex_lock(&s_stateMutex);
-        telemetry = s_telemetry;
-        recording = s_recording;
         snprintf(result, sizeof(result), "%s", s_lastResult);
         snprintf(pi4Message, sizeof(pi4Message), "%s", s_pi4Message);
         pthread_mutex_unlock(&s_stateMutex);
 
-        double longitude = NAN;
-        double latitude = NAN;
-        const char *positionSource = "NONE";
-        if (telemetry.rtkPositionValid) {
-            longitude = telemetry.rtkPosition.longitude;
-            latitude = telemetry.rtkPosition.latitude;
-            positionSource = "RTK";
-        } else if (telemetry.fusedPositionValid) {
-            longitude = telemetry.fusedPosition.longitude * M400_DEG_PER_RAD;
-            latitude = telemetry.fusedPosition.latitude * M400_DEG_PER_RAD;
-            positionSource = "FUSED";
-        }
-
-        if (pi4Message[0] != '\0') {
-            int written = snprintf(message, sizeof(message),
-                                   "REC:%s RTK:%s POS:%s\r\nLon:%.7f Lat:%.7f\r\nCMD:%s\r\nPI4:%s",
-                                   recording ? "ON" : "OFF", M400RtkStatusText(&telemetry), positionSource,
-                                   longitude, latitude, result, pi4Message);
-            if (written < 0 || (size_t) written >= sizeof(message)) {
-                snprintf(message, sizeof(message), "PI4:%s", pi4Message);
+        /* Keep the full CMD line; shorten only an unusually long Pi4 message. */
+        const size_t maxPi4Bytes = sizeof(message) - 1 - strlen("PI4:\r\nCMD:") - strlen(result);
+        const char *suffix = "";
+        if (strlen(pi4Message) > maxPi4Bytes) {
+            size_t keep = maxPi4Bytes - strlen("...");
+            while (keep > 0 && ((unsigned char) pi4Message[keep] & 0xC0) == 0x80) {
+                --keep;
             }
-        } else {
-            snprintf(message, sizeof(message),
-                     "REC:%s RTK:%s POS:%s\r\nLon:%.7f Lat:%.7f\r\nCMD:%s",
-                     recording ? "ON" : "OFF", M400RtkStatusText(&telemetry), positionSource,
-                     longitude, latitude, result);
+            pi4Message[keep] = '\0';
+            suffix = "...";
         }
+        size_t messageLength = 0;
+        memcpy(message + messageLength, "PI4:", 4);
+        messageLength += 4;
+        const size_t pi4Length = strlen(pi4Message);
+        memcpy(message + messageLength, pi4Message, pi4Length);
+        messageLength += pi4Length;
+        const size_t suffixLength = strlen(suffix);
+        memcpy(message + messageLength, suffix, suffixLength);
+        messageLength += suffixLength;
+        memcpy(message + messageLength, "\r\nCMD:", 6);
+        messageLength += 6;
+        const size_t resultLength = strlen(result);
+        memcpy(message + messageLength, result, resultLength);
+        messageLength += resultLength;
+        message[messageLength] = '\0';
         T_DjiReturnCode rc = DjiWidgetFloatingWindow_ShowMessage(message);
         if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
             USER_LOG_WARN("Update widget status failed: 0x%08llX", (unsigned long long) rc);

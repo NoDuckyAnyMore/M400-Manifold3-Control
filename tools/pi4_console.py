@@ -7,11 +7,12 @@ from collections import deque
 from datetime import datetime, timezone
 import locale
 import queue
-import socket
 import threading
 import time
 from typing import Tuple
 import unicodedata
+
+from m400_pi4_client import M400Pi4Client
 
 MIN_M3_TIME_NS = 1_577_836_800_000_000_000  # 2020-01-01 UTC
 MAX_M3_TIME_NS = 4_102_444_800_000_000_000  # 2100-01-01 UTC
@@ -22,39 +23,31 @@ class Link:
         self.lock = threading.Lock()
         self.connection = None
 
-    def set(self, connection: socket.socket) -> None:
+    def set(self, connection: M400Pi4Client) -> None:
         with self.lock:
             self.connection = connection
 
-    def clear(self, connection: socket.socket) -> None:
+    def clear(self, connection: M400Pi4Client) -> None:
         with self.lock:
             if self.connection is connection:
                 self.connection = None
 
     def send_text(self, message: str) -> None:
-        payload = message.encode("utf-8")
-        if not payload or len(payload) > 240 or b"\n" in payload or b"\r" in payload:
-            raise ValueError("请输入一行不超过 240 字节的文字")
         with self.lock:
             if self.connection is None:
                 raise ConnectionError("尚未连接妙算 3")
-            self.connection.sendall(b"TEXT\t" + payload + b"\n")
+            self.connection.send_text(message)
 
     def send_time_request(self) -> int:
         with self.lock:
             if self.connection is None:
                 raise ConnectionError("尚未连接妙算 3")
-            origin = time.time_ns()
-            self.connection.sendall(b"TIME_REQ\t" + str(origin).encode("ascii") + b"\n")
-            return origin
+            return self.connection.send_time_request()
 
     def close(self) -> None:
         with self.lock:
             if self.connection is not None:
-                try:
-                    self.connection.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
+                self.connection.close()
                 self.connection = None
 
 
@@ -77,75 +70,72 @@ def receive_loop(host: str, port: int, link: Link, updates: queue.Queue,
     while not stop.is_set():
         connection = None
         try:
-            connection = socket.create_connection((host, port), timeout=3)
-            connection.sendall(b"SUBSCRIBE_BUTTONS\n")
-            connection.settimeout(None)
-            with connection.makefile("rb") as incoming:
-                if incoming.readline() != b"OK\n":
-                    raise ConnectionError("订阅被拒绝")
-                link.set(connection)
-                updates.put(("status", "已连接"))
-                samples = []
-                pending_origin = None
-                attempts = 0
-                for raw_line in incoming:
-                    destination = time.time_ns()
-                    line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
-                    if line == "PING":
+            connection = M400Pi4Client(host, port)
+            connection.connect()
+            link.set(connection)
+            updates.put(("status", "已连接"))
+            samples = []
+            pending_origin = None
+            attempts = 0
+            for line in connection.lines():
+                destination = time.time_ns()
+                if line == "PING":
+                    continue
+                if line == "TIME_POLL":
+                    samples.clear()
+                    pending_origin = link.send_time_request()
+                    attempts = 1
+                elif line.startswith("TIME_RESP\t"):
+                    try:
+                        _, origin_text, receive_text, transmit_text = line.split("\t")
+                        origin, received, transmitted = map(
+                            int, (origin_text, receive_text, transmit_text))
+                    except ValueError:
                         continue
-                    if line == "TIME_POLL":
-                        samples.clear()
+                    if origin != pending_origin:
+                        continue
+                    pending_origin = None
+                    offset, delay = estimate_offset(origin, received,
+                                                    transmitted, destination)
+                    if delay >= 0:
+                        samples.append((delay, offset, transmitted))
+                    if len(samples) < 3 and attempts < 5:
                         pending_origin = link.send_time_request()
-                        attempts = 1
-                    elif line.startswith("TIME_RESP\t"):
-                        try:
-                            _, origin_text, receive_text, transmit_text = line.split("\t")
-                            origin, received, transmitted = map(
-                                int, (origin_text, receive_text, transmit_text))
-                        except ValueError:
-                            continue
-                        if origin != pending_origin:
-                            continue
-                        pending_origin = None
-                        offset, delay = estimate_offset(origin, received,
-                                                        transmitted, destination)
-                        if delay >= 0:
-                            samples.append((delay, offset, transmitted))
-                        if len(samples) < 3 and attempts < 5:
-                            pending_origin = link.send_time_request()
-                            attempts += 1
-                            continue
-                        if not samples:
-                            updates.put(("message", "时间取样失败，等待下一次取样"))
-                            continue
-                        best_delay, best_offset, m3_time = min(samples)
-                        updates.put(("time", f"差 {format_offset(best_offset)}  RTT {best_delay / 1_000_000:.2f}ms"))
-                        plausible = MIN_M3_TIME_NS <= m3_time <= MAX_M3_TIME_NS
-                        if plausible:
-                            m3_utc = datetime.fromtimestamp(m3_time // 1_000_000_000,
-                                                            timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                            updates.put(("message", f"M3 时间 {m3_utc}；Pi4 时差 {format_offset(best_offset)}"))
-                        else:
-                            updates.put(("message", "M3 时间超出合理范围，未调整 Pi4 时钟"))
-                        if sync_enabled.is_set():
-                            if not plausible:
-                                pass
-                            elif best_delay > 200_000_000:
-                                updates.put(("message", "网络往返超过 200ms，未调整 Pi4 时钟"))
-                            elif abs(best_offset) >= 1_000_000:
-                                try:
-                                    time.clock_settime_ns(time.CLOCK_REALTIME,
-                                                          time.time_ns() + best_offset)
-                                    updates.put(("message", "已校准 Pi4 系统时间；下次取样可查看剩余时差"))
-                                except OSError as error:
-                                    sync_enabled.clear()
-                                    updates.put(("message", f"校时失败（需 sudo/CAP_SYS_TIME）: {error}"))
-                            else:
-                                updates.put(("message", "时差小于 1ms，无需调整"))
-                    elif line.startswith("ACK\t"):
-                        updates.put(("message", "M3 确认: " + line[4:]))
+                        attempts += 1
+                        continue
+                    if not samples:
+                        updates.put(("time", "时间取样失败，等待下一次取样"))
+                        continue
+                    best_delay, best_offset, m3_time = min(samples)
+                    time_status = (f"时差 {format_offset(best_offset)}  "
+                                   f"RTT {best_delay / 1_000_000:.2f}ms")
+                    plausible = MIN_M3_TIME_NS <= m3_time <= MAX_M3_TIME_NS
+                    if plausible:
+                        m3_utc = datetime.fromtimestamp(m3_time // 1_000_000_000,
+                                                        timezone.utc).strftime("%H:%M:%S")
+                        time_status += f"  M3 {m3_utc}Z"
                     else:
-                        updates.put(("message", "M3 → Pi4: " + line.replace("\t", "  ")))
+                        time_status += "  M3 时间异常，未校时"
+                    if sync_enabled.is_set():
+                        if not plausible:
+                            pass
+                        elif best_delay > 200_000_000:
+                            time_status += "  RTT 过高，未校时"
+                        elif abs(best_offset) >= 1_000_000:
+                            try:
+                                time.clock_settime_ns(time.CLOCK_REALTIME,
+                                                      time.time_ns() + best_offset)
+                                time_status += "  已校时"
+                            except OSError as error:
+                                sync_enabled.clear()
+                                updates.put(("message", f"校时失败（需 sudo/CAP_SYS_TIME）: {error}"))
+                        else:
+                            time_status += "  无需校时"
+                    updates.put(("time", time_status))
+                elif line.startswith("ACK\t"):
+                    updates.put(("message", "M3 确认: " + line[4:]))
+                else:
+                    updates.put(("message", "M3 → Pi4: " + line.replace("\t", "  ")))
         except OSError as error:
             if not stop.is_set():
                 updates.put(("message", "连接中断: " + str(error)))
@@ -173,8 +163,8 @@ def draw(stdscr, messages: deque, typed: str, status: str,
         except curses.error:
             pass
 
-    write(0, f"M3 ↔ Pi4 {status} | 校时:{'开' if sync_enabled else '关'}  Ctrl+T切换  Ctrl+C退出")
-    write(1, time_status)
+    write(0, f"M3 ↔ Pi4 {status} | {time_status}")
+    write(1, f"校时:{'开' if sync_enabled else '关'}  Ctrl+T切换  Ctrl+C退出")
     visible = list(messages)[-(rows - 4):]
     for row, message in enumerate(visible, start=2):
         write(row, message)

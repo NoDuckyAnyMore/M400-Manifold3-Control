@@ -98,7 +98,7 @@ kmzPath = fullfile(cfg.outputDir, [cfg.outputName '.kmz']);
 if isfile(kmzPath), error('目标 KMZ 已存在，避免覆盖：%s', kmzPath); end
 previewPaths = struct('map2D','','route3D','');
 if cfg.showPreview
-    [fig2D,fig3D] = previewRoute(regionLatLon, pathLatLon, pathENU, pathHeight, layerIndex, cfg);
+    [fig2D,fig3D] = previewRoute(regionLatLon, pathLatLon, pathENU, pathHeight, layerIndex, geo, cfg);
     if cfg.savePreviewImages
         previewPaths.map2D = fullfile(cfg.outputDir,[cfg.outputName '_map2d.png']);
         previewPaths.route3D = fullfile(cfg.outputDir,[cfg.outputName '_route3d.png']);
@@ -310,7 +310,22 @@ for j=1:numel(params)-1
     z=(params(j)+params(j+1))/2;
     sample=p+z*r;
     [inside,on]=inpolygon(sample(1),sample(2),poly(:,1),poly(:,2));
-    if ~(inside||on), yes=false; return; end
+    if ~(inside||on) && polygonBoundaryDistance(sample,poly)>1e-4
+        yes=false; return;
+    end
+end
+end
+
+function distance = polygonBoundaryDistance(p,poly)
+% ENU 米坐标上的浮点容差：仅把极贴近边界的点视为边界点。
+distance=inf;
+for j=1:size(poly,1)
+    a=poly(j,:);
+    edge=poly(mod(j,size(poly,1))+1,:)-a;
+    edgeLength2=dot(edge,edge);
+    if edgeLength2<eps, continue; end
+    t=max(0,min(1,dot(p-a,edge)/edgeLength2));
+    distance=min(distance,norm(p-(a+t*edge)));
 end
 end
 
@@ -318,7 +333,7 @@ function z = cross2(a,b)
 z=a(1)*b(2)-a(2)*b(1);
 end
 
-function [fig2D,fig3D] = previewRoute(regionLL,routeLL,routeEN,heights,layers,cfg)
+function [fig2D,fig3D] = previewRoute(regionLL,routeLL,routeEN,heights,layers,geo,cfg)
 fig2D=figure('Name','M400 多高度层扫描航线（二维）','NumberTitle','off');
 gx=geoaxes;
 geobasemap(gx,cfg.mapBasemap);
@@ -330,8 +345,17 @@ for k=1:max(layers)
     idx=find(layers==k);
     geoplot(gx,routeLL(idx,1),routeLL(idx,2),'-o', ...
         'Color',palette(k,:),'MarkerSize',3);
+    if k==1
+        % 高度层重叠在同一张地图上；仅画首层箭头，避免反向箭头相互盖住。
+        [arrowEN,~]=directionArrows(routeEN,heights,idx(1:end-1));
+        arrowLL=enuToLL(arrowEN,geo);
+        geoplot(gx,arrowLL(:,1),arrowLL(:,2),'-', ...
+            'Color',[1 0.85 0],'LineWidth',1.8);
+    end
 end
-title(gx,'二维预览：黑线=区域；彩线=各高度层（跨层连接看三维图）');
+geoplot(gx,routeLL(1,1),routeLL(1,2),'go','MarkerFaceColor','g');
+geoplot(gx,routeLL(end,1),routeLL(end,2),'rs','MarkerFaceColor','r');
+title(gx,'二维预览：黄箭头=首层方向；其他层看三维图');
 fig3D=figure('Name','M400 多高度层扫描航线（三维）','NumberTitle','off');
 hold on;
 for k=1:max(layers)
@@ -339,10 +363,19 @@ for k=1:max(layers)
     plot3(routeEN(idx,1),routeEN(idx,2),heights(idx),'-o', ...
         'Color',palette(k,:),'MarkerSize',3, ...
         'DisplayName',sprintf('第 %d 层：%g m',k,heights(idx(1))));
+    [arrowEN,arrowHeight]=directionArrows(routeEN,heights,idx(1:end-1));
+    plot3(arrowEN(:,1),arrowEN(:,2),arrowHeight,'-', ...
+        'Color',[0.15 0.15 0.15],'LineWidth',1.5,'HandleVisibility','off');
     if k>1
         p=idx(1)-1;
         plot3(routeEN([p idx(1)],1),routeEN([p idx(1)],2), ...
             heights([p idx(1)]),'k--','HandleVisibility','off');
+        deltaH=heights(idx(1))-heights(p);
+        if abs(deltaH)>0.1
+            quiver3(routeEN(p,1),routeEN(p,2),heights(p)+deltaH/2, ...
+                0,0,sign(deltaH)*min(5,abs(deltaH)/3),0, ...
+                'Color',[0.15 0.15 0.15],'LineWidth',1.5,'HandleVisibility','off');
+        end
     end
 end
 plot3(routeEN(1,1),routeEN(1,2),heights(1),'go', ...
@@ -350,8 +383,32 @@ plot3(routeEN(1,1),routeEN(1,2),heights(1),'go', ...
 plot3(routeEN(end,1),routeEN(end,2),heights(end),'rs', ...
     'MarkerFaceColor','r','DisplayName','终点');
 grid on; axis equal; xlabel('东 / m'); ylabel('北 / m');
-zlabel('相对起飞点高度 / m'); title('三维航点顺序');
-view(35,25); legend('Location','best');
+zlabel('相对起飞点高度 / m'); title('三维航点顺序：箭头=飞行方向');
+view(35,25); legend('Location','northeastoutside');
+end
+
+function [arrowEN,arrowHeight] = directionArrows(routeEN,heights,segments)
+% 每段中部画一个 ENU 箭头；过密时均匀抽样，避免预览图被箭头覆盖。
+arrowEN=zeros(0,2);
+arrowHeight=zeros(0,1);
+if isempty(segments), return; end
+segments=segments(round(linspace(1,numel(segments),min(numel(segments),40))));
+for i=segments(:)'
+    delta=routeEN(i+1,:)-routeEN(i,:);
+    distance=norm(delta);
+    if distance<2, continue; end
+    unit=delta/distance;
+    perpendicular=[-unit(2),unit(1)];
+    arrowLength=min(5,distance*0.3);
+    tip=routeEN(i,:)+delta*0.6;
+    tail=tip-unit*arrowLength;
+    wingBase=tip-unit*arrowLength*0.4;
+    wingLeft=wingBase+perpendicular*arrowLength*0.25;
+    wingRight=wingBase-perpendicular*arrowLength*0.25;
+    arrowEN=[arrowEN;tail;tip;NaN NaN;wingLeft;tip;wingRight;NaN NaN]; %#ok<AGROW>
+    arrowHeight=[arrowHeight;heights(i);heights(i);NaN; ...
+        heights(i);heights(i);heights(i);NaN]; %#ok<AGROW>
+end
 end
 
 function writeWpml(path,cfg,ll,h,executable)
