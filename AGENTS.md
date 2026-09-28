@@ -35,7 +35,7 @@ $pi = 'pi4@192.168.124.14'
 $m3 = 'dji@10.88.77.54'
 scp -J $pi 'samples/sample_c/module_sample/m400_control/m400_control_service.c' "${m3}:/home/dji/m400-src-v07/samples/sample_c/module_sample/m400_control/"
 # 如果修改了通信模块，也分别上传 m400_pi4_bridge.c 和 m400_pi4_bridge.h 到同一目录。
-# 两点航线功能还须上传 m400_waypoint_kmz.c/.h 和 m400_control_service.h；新增 .c 后重新运行 cmake 配置以更新 GLOB 源文件列表。
+# 两点航线与遥控器告警功能还须上传 m400_waypoint_kmz.c/.h、m400_control_alert.c/.h 和 m400_control_service.h；新增 .c 后重新运行 cmake 配置以更新 GLOB 源文件列表。
 # 如果修改了控件，上传中英文 widget_config.json 到 M3 源码中的对应目录。
 # 仅明确改版本时，才上传本机 app.json 与 application.cpp。
 ssh -J $pi $m3

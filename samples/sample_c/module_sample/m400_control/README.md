@@ -34,4 +34,8 @@ at button press; the final yaw is an absolute heading from north. It only starts
 is present in the KMZ but does not affect an airborne aircraft. Waypoint startup is synchronous; flight is not.
 The two fixed-target Pilot buttons use the same Waypoint 3 implementation at 2 or 10 m/s, with a second press
 within 10 seconds required to start. Their final yaw is the bearing toward the fixed target.
+The Pilot controller alert module (`m400_control_alert.c`) requests one buzzer beep on task start,
+one buzzer beep plus vibration on completion, or three combined alerts 500 ms apart on failure/interruption.
+Waypoint completion is inferred from the final yaw action callback followed by mission IDLE; alerts are
+asynchronous and must not be treated as proof of physical arrival without Pilot/telemetry verification.
 Recording writes a 50 Hz CSV file under `data/logs`; recording is off when the application starts.
