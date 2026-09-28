@@ -47,28 +47,25 @@
                 ],
                 "customize_rc_buttons_config": { "is_enable": false, "mapping_config_display_order": 2 }
             },
-            { "widget_index": 8, "widget_type": "button", "widget_name": "Forward 1 m (position)", "customize_rc_buttons_config": { "is_enable": false, "mapping_config_display_order": 3 } },
-            { "widget_index": 9, "widget_type": "button", "widget_name": "Backward 1 m (position)", "customize_rc_buttons_config": { "is_enable": false, "mapping_config_display_order": 4 } },
-            { "widget_index": 10, "widget_type": "button", "widget_name": "Move left 1 m (position)", "customize_rc_buttons_config": { "is_enable": false, "mapping_config_display_order": 5 } },
-            { "widget_index": 11, "widget_type": "button", "widget_name": "Move right 1 m (position)", "customize_rc_buttons_config": { "is_enable": false, "mapping_config_display_order": 6 } },
-            { "widget_index": 12, "widget_type": "button", "widget_name": "Up 1 m (position)", "customize_rc_buttons_config": { "is_enable": false, "mapping_config_display_order": 7 } },
-            { "widget_index": 13, "widget_type": "button", "widget_name": "Down 1 m (position)", "customize_rc_buttons_config": { "is_enable": false, "mapping_config_display_order": 8 } },
-            { "widget_index": 14, "widget_type": "button", "widget_name": "Forward 5 m (position)", "customize_rc_buttons_config": { "is_enable": false, "mapping_config_display_order": 9 } },
-            { "widget_index": 15, "widget_type": "button", "widget_name": "Yaw left 90 degrees", "customize_rc_buttons_config": { "is_enable": false, "mapping_config_display_order": 10 } },
-            { "widget_index": 16, "widget_type": "button", "widget_name": "Yaw right 90 degrees", "customize_rc_buttons_config": { "is_enable": false, "mapping_config_display_order": 11 } },
-            { "widget_index": 17, "widget_type": "button", "widget_name": "Staged goto F2 20m", "customize_rc_buttons_config": { "is_enable": false, "mapping_config_display_order": 12 } },
-            { "widget_index": 18, "widget_type": "button", "widget_name": "Staged goto F10 20m", "customize_rc_buttons_config": { "is_enable": false, "mapping_config_display_order": 13 } },
-            { "widget_index": 19, "widget_type": "button", "widget_name": "Sample goto F2 20m", "customize_rc_buttons_config": { "is_enable": false, "mapping_config_display_order": 14 } },
+            { "widget_index": 8, "widget_type": "int_input_box", "widget_name": "Waypoint forward/back (m)", "int_input_box_hint": "-10 to 10; positive forward" },
+            { "widget_index": 9, "widget_type": "int_input_box", "widget_name": "Waypoint left/right (m)", "int_input_box_hint": "-10 to 10; positive left" },
+            { "widget_index": 10, "widget_type": "int_input_box", "widget_name": "Waypoint up/down (m)", "int_input_box_hint": "-10 to 10; positive up" },
+            { "widget_index": 11, "widget_type": "int_input_box", "widget_name": "Waypoint speed (m/s)", "int_input_box_hint": "1 to 10; default 2" },
+            { "widget_index": 12, "widget_type": "int_input_box", "widget_name": "Safe takeoff height (m)", "int_input_box_hint": "Ignored in air; default 40" },
+            { "widget_index": 13, "widget_type": "int_input_box", "widget_name": "Final yaw (deg)", "int_input_box_hint": "-180 to 180; absolute from north" },
+            { "widget_index": 14, "widget_type": "button", "widget_name": "Execute straight two-point route", "customize_rc_buttons_config": { "is_enable": false, "mapping_config_display_order": 3 } },
+            { "widget_index": 15, "widget_type": "button", "widget_name": "Fixed waypoint 2 m/s, H20 m", "customize_rc_buttons_config": { "is_enable": false, "mapping_config_display_order": 4 } },
+            { "widget_index": 16, "widget_type": "button", "widget_name": "Fixed waypoint 10 m/s, H20 m", "customize_rc_buttons_config": { "is_enable": false, "mapping_config_display_order": 5 } },
             {
-                "widget_index": 20, "widget_type": "list", "widget_name": "Browse CSV files",
+                "widget_index": 17, "widget_type": "list", "widget_name": "Browse CSV files",
                 "list_item": [
                     { "item_name": "Newest" }, { "item_name": "Previous" }, { "item_name": "Third newest" },
                     { "item_name": "Fourth newest" }, { "item_name": "Fifth newest" }
                 ],
-                "customize_rc_buttons_config": { "is_enable": false, "mapping_config_display_order": 15 }
+                "customize_rc_buttons_config": { "is_enable": false, "mapping_config_display_order": 6 }
             },
-            { "widget_index": 21, "widget_type": "int_input_box", "widget_name": "Selected CSV date (read only)", "int_input_box_hint": "YYYYMMDD" },
-            { "widget_index": 22, "widget_type": "int_input_box", "widget_name": "Selected CSV time (read only)", "int_input_box_hint": "HHMMSS; full name in floating window" }
+            { "widget_index": 18, "widget_type": "int_input_box", "widget_name": "Selected CSV date (read only)", "int_input_box_hint": "YYYYMMDD" },
+            { "widget_index": 19, "widget_type": "int_input_box", "widget_name": "Selected CSV time (read only)", "int_input_box_hint": "HHMMSS; full name in floating window" }
         ]
     }
 }

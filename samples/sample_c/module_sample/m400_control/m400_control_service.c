@@ -5,12 +5,14 @@
 
 #include "m400_control_service.h"
 #include "m400_pi4_bridge.h"
+#include "m400_waypoint_kmz.h"
 
 #include <dji_fc_subscription.h>
 #include <dji_flight_controller.h>
 #include <dji_logger.h>
 #include <dji_platform.h>
 #include <dji_widget.h>
+#include <dji_waypoint_v3.h>
 
 #include <dirent.h>
 #include <errno.h>
@@ -58,11 +60,11 @@
 #define M400_HORIZONTAL_SETPOINT_RATE_MPS   1.0f
 #define M400_HORIZONTAL_SETPOINT_ACCEL_MPS2 0.5f
 #define M400_GOTO_MAX_DISTANCE_M            100.0
-#define M400_GOTO_CONFIRM_MS                10000U
+#define M400_FIXED_WAYPOINT_CONFIRM_MS      10000U
 #define M400_TEST_LATITUDE_DEG              22.602549522388877
 #define M400_TEST_LONGITUDE_DEG             113.99172104792952
 #define M400_TEST_HEIGHT_M                  20.0f
-#define M400_WIDGET_COUNT                   23U
+#define M400_WIDGET_COUNT                   20U
 
 // Pilot 2 displays config widgets by widget_index, not by JSON array order.
 enum {
@@ -74,21 +76,18 @@ enum {
     M400_WIDGET_LATITUDE = 5,
     M400_WIDGET_COMMAND_STATE = 6,
     M400_WIDGET_EMERGENCY_HOVER = 7,
-    M400_WIDGET_FORWARD_1M = 8,
-    M400_WIDGET_BACKWARD_1M = 9,
-    M400_WIDGET_LEFT_1M = 10,
-    M400_WIDGET_RIGHT_1M = 11,
-    M400_WIDGET_UP_1M = 12,
-    M400_WIDGET_DOWN_1M = 13,
-    M400_WIDGET_FORWARD_5M = 14,
-    M400_WIDGET_YAW_LEFT = 15,
-    M400_WIDGET_YAW_RIGHT = 16,
-    M400_WIDGET_GOTO_STAGED_2 = 17,
-    M400_WIDGET_GOTO_STAGED_10 = 18,
-    M400_WIDGET_GOTO_OFFICIAL_2 = 19,
-    M400_WIDGET_CSV_SELECT = 20,
-    M400_WIDGET_CSV_DATE = 21,
-    M400_WIDGET_CSV_TIME = 22,
+    M400_WIDGET_WAYPOINT_FORWARD = 8,
+    M400_WIDGET_WAYPOINT_LEFT = 9,
+    M400_WIDGET_WAYPOINT_UP = 10,
+    M400_WIDGET_WAYPOINT_SPEED = 11,
+    M400_WIDGET_WAYPOINT_SAFE_HEIGHT = 12,
+    M400_WIDGET_WAYPOINT_YAW = 13,
+    M400_WIDGET_WAYPOINT_EXECUTE = 14,
+    M400_WIDGET_WAYPOINT_FIXED_2 = 15,
+    M400_WIDGET_WAYPOINT_FIXED_10 = 16,
+    M400_WIDGET_CSV_SELECT = 17,
+    M400_WIDGET_CSV_DATE = 18,
+    M400_WIDGET_CSV_TIME = 19,
 };
 
 static const char *const s_widgetEventNames[M400_WIDGET_COUNT] = {
@@ -96,18 +95,9 @@ static const char *const s_widgetEventNames[M400_WIDGET_COUNT] = {
     [M400_WIDGET_STOP_RECORD] = "stop_record",
     [M400_WIDGET_RECORD_SWITCH] = "record_switch",
     [M400_WIDGET_EMERGENCY_HOVER] = "emergency_hover",
-    [M400_WIDGET_FORWARD_1M] = "forward_1m",
-    [M400_WIDGET_BACKWARD_1M] = "backward_1m",
-    [M400_WIDGET_LEFT_1M] = "left_1m",
-    [M400_WIDGET_RIGHT_1M] = "right_1m",
-    [M400_WIDGET_UP_1M] = "up_1m",
-    [M400_WIDGET_DOWN_1M] = "down_1m",
-    [M400_WIDGET_FORWARD_5M] = "forward_5m",
-    [M400_WIDGET_YAW_LEFT] = "yaw_left",
-    [M400_WIDGET_YAW_RIGHT] = "yaw_right",
-    [M400_WIDGET_GOTO_STAGED_2] = "goto_staged_f2",
-    [M400_WIDGET_GOTO_STAGED_10] = "goto_staged_f10",
-    [M400_WIDGET_GOTO_OFFICIAL_2] = "goto_official_f2",
+    [M400_WIDGET_WAYPOINT_EXECUTE] = "waypoint_execute",
+    [M400_WIDGET_WAYPOINT_FIXED_2] = "waypoint_fixed_2mps",
+    [M400_WIDGET_WAYPOINT_FIXED_10] = "waypoint_fixed_10mps",
     [M400_WIDGET_CSV_SELECT] = "csv_select",
 };
 
@@ -122,10 +112,10 @@ typedef enum {
     M400_COMMAND_UP,
     M400_COMMAND_DOWN,
     M400_COMMAND_FORWARD_5M,
-    M400_COMMAND_GOTO_STAGED,
-    M400_COMMAND_GOTO_STAGED_10,
-    M400_COMMAND_GOTO_OFFICIAL,
+    M400_COMMAND_WAYPOINT_FIXED_2,
+    M400_COMMAND_WAYPOINT_FIXED_10,
     M400_COMMAND_EMERGENCY_HOVER,
+    M400_COMMAND_WAYPOINT_RELATIVE,
 } E_M400QueuedCommand;
 
 typedef enum {
@@ -171,6 +161,8 @@ static bool s_recording = false;
 static bool s_serviceStarted = false;
 static bool s_flightControllerInitialized = false;
 static bool s_abortMotion = false;
+static bool s_authorityRevoked = false;
+static int s_authorityLossReason = 0;
 static E_M400QueuedCommand s_pendingCommand = M400_COMMAND_NONE;
 static char s_currentCsvFile[M400_FILENAME_LENGTH] = "none";
 static char s_csvFiles[M400_MAX_CSV_FILES][M400_FILENAME_LENGTH];
@@ -178,11 +170,18 @@ static size_t s_csvFileCount = 0;
 static size_t s_selectedCsvIndex = 0;
 static char s_lastResult[M400_RESULT_LENGTH] = "Ready";
 static char s_pi4Message[M400_PI4_MESSAGE_MAX_BYTES + 1] = "";
-static int32_t s_widgetValues[M400_WIDGET_COUNT] = {0};
+static int32_t s_widgetValues[M400_WIDGET_COUNT] = {
+    [M400_WIDGET_WAYPOINT_SPEED] = 2,
+    [M400_WIDGET_WAYPOINT_SAFE_HEIGHT] = 40,
+};
 static uint64_t s_buttonFeedbackUntilMs[M400_WIDGET_COUNT] = {0};
 static E_M400CommandState s_commandState = M400_COMMAND_STATE_IDLE;
 static E_M400QueuedCommand s_armedGotoCommand = M400_COMMAND_NONE;
 static uint64_t s_gotoArmUntilMs = 0;
+static bool s_waypointInitialized = false;
+static bool s_waypointActive = false;
+static T_M400WaypointMove s_pendingWaypointMove = {0};
+static float s_pendingFixedSafeHeightM = 40.0f;
 
 static void *M400TelemetryTask(void *arg);
 static void *M400StatusTask(void *arg);
@@ -190,6 +189,41 @@ static void *M400ControlTask(void *arg);
 static T_DjiReturnCode M400WidgetSetValue(E_DjiWidgetType widgetType, uint32_t index, int32_t value, void *userData);
 static T_DjiReturnCode M400WidgetGetValue(E_DjiWidgetType widgetType, uint32_t index, int32_t *value, void *userData);
 static float M400CurrentYawDegree(const T_DjiFcSubscriptionQuaternion *q);
+static T_DjiReturnCode M400JoystickAuthorityCallback(
+    T_DjiFlightControllerJoystickCtrlAuthorityEventInfo eventData);
+static T_DjiReturnCode M400WaypointMissionStateCallback(T_DjiWaypointV3MissionState missionState);
+static T_DjiReturnCode M400WaypointActionStateCallback(T_DjiWaypointV3ActionState actionState);
+
+static T_DjiReturnCode M400WaypointMissionStateCallback(T_DjiWaypointV3MissionState missionState)
+{
+    pthread_mutex_lock(&s_stateMutex);
+    if (s_waypointActive && missionState.state == DJI_WAYPOINT_V3_MISSION_STATE_IDLE) {
+        s_waypointActive = false;
+        s_commandState = M400_COMMAND_STATE_IDLE;
+        snprintf(s_lastResult, sizeof(s_lastResult), "Waypoint ended; verify result in Pilot");
+    } else if (s_waypointActive && missionState.state == DJI_WAYPOINT_V3_MISSION_STATE_BREAK) {
+        s_commandState = M400_COMMAND_STATE_REJECTED;
+        snprintf(s_lastResult, sizeof(s_lastResult), "Waypoint paused/interrupted at point %u",
+                 (unsigned int) missionState.currentWaypointIndex);
+    } else if (s_waypointActive) {
+        s_commandState = M400_COMMAND_STATE_RUNNING;
+    }
+    pthread_mutex_unlock(&s_stateMutex);
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+static T_DjiReturnCode M400WaypointActionStateCallback(T_DjiWaypointV3ActionState actionState)
+{
+    if (actionState.actionGroupId == 0 && actionState.actionId == 0) {
+        pthread_mutex_lock(&s_stateMutex);
+        if (s_waypointActive) {
+            snprintf(s_lastResult, sizeof(s_lastResult), "Waypoint yaw action state=%d",
+                     (int) actionState.state);
+        }
+        pthread_mutex_unlock(&s_stateMutex);
+    }
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
 
 static void M400OnPi4Message(const char *message)
 {
@@ -208,18 +242,15 @@ static const T_DjiWidgetHandlerListItem s_widgetHandlers[] = {
     {M400_WIDGET_LATITUDE, DJI_WIDGET_TYPE_INT_INPUT_BOX, M400WidgetSetValue, M400WidgetGetValue, NULL},
     {M400_WIDGET_COMMAND_STATE, DJI_WIDGET_TYPE_LIST, M400WidgetSetValue, M400WidgetGetValue, NULL},
     {M400_WIDGET_EMERGENCY_HOVER, DJI_WIDGET_TYPE_BUTTON, M400WidgetSetValue, M400WidgetGetValue, NULL},
-    {M400_WIDGET_FORWARD_1M, DJI_WIDGET_TYPE_BUTTON, M400WidgetSetValue, M400WidgetGetValue, NULL},
-    {M400_WIDGET_BACKWARD_1M, DJI_WIDGET_TYPE_BUTTON, M400WidgetSetValue, M400WidgetGetValue, NULL},
-    {M400_WIDGET_LEFT_1M, DJI_WIDGET_TYPE_BUTTON, M400WidgetSetValue, M400WidgetGetValue, NULL},
-    {M400_WIDGET_RIGHT_1M, DJI_WIDGET_TYPE_BUTTON, M400WidgetSetValue, M400WidgetGetValue, NULL},
-    {M400_WIDGET_UP_1M, DJI_WIDGET_TYPE_BUTTON, M400WidgetSetValue, M400WidgetGetValue, NULL},
-    {M400_WIDGET_DOWN_1M, DJI_WIDGET_TYPE_BUTTON, M400WidgetSetValue, M400WidgetGetValue, NULL},
-    {M400_WIDGET_FORWARD_5M, DJI_WIDGET_TYPE_BUTTON, M400WidgetSetValue, M400WidgetGetValue, NULL},
-    {M400_WIDGET_YAW_LEFT, DJI_WIDGET_TYPE_BUTTON, M400WidgetSetValue, M400WidgetGetValue, NULL},
-    {M400_WIDGET_YAW_RIGHT, DJI_WIDGET_TYPE_BUTTON, M400WidgetSetValue, M400WidgetGetValue, NULL},
-    {M400_WIDGET_GOTO_STAGED_2, DJI_WIDGET_TYPE_BUTTON, M400WidgetSetValue, M400WidgetGetValue, NULL},
-    {M400_WIDGET_GOTO_STAGED_10, DJI_WIDGET_TYPE_BUTTON, M400WidgetSetValue, M400WidgetGetValue, NULL},
-    {M400_WIDGET_GOTO_OFFICIAL_2, DJI_WIDGET_TYPE_BUTTON, M400WidgetSetValue, M400WidgetGetValue, NULL},
+    {M400_WIDGET_WAYPOINT_FORWARD, DJI_WIDGET_TYPE_INT_INPUT_BOX, M400WidgetSetValue, M400WidgetGetValue, NULL},
+    {M400_WIDGET_WAYPOINT_LEFT, DJI_WIDGET_TYPE_INT_INPUT_BOX, M400WidgetSetValue, M400WidgetGetValue, NULL},
+    {M400_WIDGET_WAYPOINT_UP, DJI_WIDGET_TYPE_INT_INPUT_BOX, M400WidgetSetValue, M400WidgetGetValue, NULL},
+    {M400_WIDGET_WAYPOINT_SPEED, DJI_WIDGET_TYPE_INT_INPUT_BOX, M400WidgetSetValue, M400WidgetGetValue, NULL},
+    {M400_WIDGET_WAYPOINT_SAFE_HEIGHT, DJI_WIDGET_TYPE_INT_INPUT_BOX, M400WidgetSetValue, M400WidgetGetValue, NULL},
+    {M400_WIDGET_WAYPOINT_YAW, DJI_WIDGET_TYPE_INT_INPUT_BOX, M400WidgetSetValue, M400WidgetGetValue, NULL},
+    {M400_WIDGET_WAYPOINT_EXECUTE, DJI_WIDGET_TYPE_BUTTON, M400WidgetSetValue, M400WidgetGetValue, NULL},
+    {M400_WIDGET_WAYPOINT_FIXED_2, DJI_WIDGET_TYPE_BUTTON, M400WidgetSetValue, M400WidgetGetValue, NULL},
+    {M400_WIDGET_WAYPOINT_FIXED_10, DJI_WIDGET_TYPE_BUTTON, M400WidgetSetValue, M400WidgetGetValue, NULL},
     {M400_WIDGET_CSV_SELECT, DJI_WIDGET_TYPE_LIST, M400WidgetSetValue, M400WidgetGetValue, NULL},
     {M400_WIDGET_CSV_DATE, DJI_WIDGET_TYPE_INT_INPUT_BOX, M400WidgetSetValue, M400WidgetGetValue, NULL},
     {M400_WIDGET_CSV_TIME, DJI_WIDGET_TYPE_INT_INPUT_BOX, M400WidgetSetValue, M400WidgetGetValue, NULL},
@@ -235,6 +266,34 @@ static uint64_t M400GetMonotonicMs(void)
 static bool M400AbortRequested(void)
 {
     return __atomic_load_n(&s_abortMotion, __ATOMIC_ACQUIRE);
+}
+
+static bool M400AuthorityRevoked(void)
+{
+    return __atomic_load_n(&s_authorityRevoked, __ATOMIC_ACQUIRE);
+}
+
+static bool M400MotionInterrupted(void)
+{
+    return M400AbortRequested() || M400AuthorityRevoked();
+}
+
+static T_DjiReturnCode M400JoystickAuthorityCallback(
+    T_DjiFlightControllerJoystickCtrlAuthorityEventInfo eventData)
+{
+    // Latch a takeover until the current command exits. A later OSDK event
+    // must not silently resume motion cancelled by the RC pause button.
+    if (eventData.curJoystickCtrlAuthority != DJI_FLIGHT_CONTROLLER_JOYSTICK_CTRL_AUTHORITY_OSDK &&
+        eventData.joystickCtrlAuthoritySwitchEvent !=
+            DJI_FLIGHT_CONTROLLER_OSDK_GET_JOYSTICK_CTRL_AUTH_EVENT) {
+        __atomic_store_n(&s_authorityLossReason,
+                         (int) eventData.joystickCtrlAuthoritySwitchEvent, __ATOMIC_RELEASE);
+        __atomic_store_n(&s_authorityRevoked, true, __ATOMIC_RELEASE);
+        USER_LOG_INFO("Joystick authority revoked: event=%d owner=%d",
+                      eventData.joystickCtrlAuthoritySwitchEvent,
+                      eventData.curJoystickCtrlAuthority);
+    }
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
 static void M400SetAbortRequested(bool requested)
@@ -591,6 +650,11 @@ static T_DjiReturnCode M400EnsureFlightControllerInitialized(void)
 
     T_DjiReturnCode rc = DjiFlightController_Init(ridInfo);
     if (rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS || rc == DJI_ERROR_SYSTEM_MODULE_CODE_DUPLICATE) {
+        rc = DjiFlightController_RegJoystickCtrlAuthorityEventCallback(M400JoystickAuthorityCallback);
+        if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+            M400SetResult("Authority callback failed: 0x%08llX", (unsigned long long) rc);
+            return rc;
+        }
         s_flightControllerInitialized = true;
         return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
     }
@@ -613,13 +677,48 @@ static T_DjiReturnCode M400CheckAircraftInAir(void)
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
+static T_DjiReturnCode M400EnsureWaypointInitialized(void)
+{
+    if (s_waypointInitialized) return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+    T_DjiReturnCode rc = DjiWaypointV3_Init();
+    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS &&
+        rc != DJI_ERROR_SYSTEM_MODULE_CODE_DUPLICATE) {
+        M400SetResult("Waypoint V3 init failed: 0x%08llX", (unsigned long long) rc);
+        return rc;
+    }
+    rc = DjiWaypointV3_RegMissionStateCallback(M400WaypointMissionStateCallback);
+    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        M400SetResult("Waypoint state callback failed: 0x%08llX", (unsigned long long) rc);
+        return rc;
+    }
+    s_waypointInitialized = true;
+    rc = DjiWaypointV3_RegActionStateCallback(M400WaypointActionStateCallback);
+    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        USER_LOG_WARN("Waypoint action callback unavailable: 0x%08llX", (unsigned long long) rc);
+    }
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
 static T_DjiReturnCode M400ObtainAuthority(void)
 {
+    pthread_mutex_lock(&s_stateMutex);
+    bool waypointActive = s_waypointActive;
+    pthread_mutex_unlock(&s_stateMutex);
+    if (waypointActive) {
+        M400SetResult("Joystick denied: waypoint mission active");
+        return DJI_ERROR_SYSTEM_MODULE_CODE_BUSY;
+    }
     T_DjiReturnCode rc = M400EnsureFlightControllerInitialized();
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) return rc;
+    // A new user command may request authority again; a takeover during this
+    // request remains latched and must not be cleared after the SDK call.
+    __atomic_store_n(&s_authorityRevoked, false, __ATOMIC_RELEASE);
     rc = DjiFlightController_ObtainJoystickCtrlAuthority();
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-        M400SetResult("Authority failed: RC must be P mode (0x%08llX)", (unsigned long long) rc);
+        M400SetResult("Authority denied by FC: 0x%08llX", (unsigned long long) rc);
+    } else if (M400AuthorityRevoked()) {
+        M400SetResult("Authority changed during request; command cancelled");
+        rc = DJI_ERROR_SYSTEM_MODULE_CODE_EXECUTING_HIGHER_PRIORITY_TASK;
     }
     return rc;
 }
@@ -637,6 +736,7 @@ static T_DjiReturnCode M400SendStableZero(unsigned int durationMs)
     DjiFlightController_SetJoystickMode(mode);
     T_DjiReturnCode lastRc = DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
     for (unsigned int elapsed = 0; elapsed < durationMs; elapsed += M400_CONTROL_PERIOD_MS) {
+        if (M400AuthorityRevoked()) return DJI_ERROR_SYSTEM_MODULE_CODE_EXECUTING_HIGHER_PRIORITY_TASK;
         T_DjiReturnCode rc = DjiFlightController_ExecuteJoystickAction(zeroCommand);
         if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) lastRc = rc;
         usleep(M400_CONTROL_PERIOD_MS * 1000);
@@ -810,7 +910,7 @@ T_DjiReturnCode M400Control_YawRelative(float deltaDegree)
     const uint64_t freshWaitStartMs = M400GetMonotonicMs();
     bool initialSampleFresh = false;
     while (M400GetMonotonicMs() - freshWaitStartMs < M400_POSITION_STALE_MS) {
-        if (M400AbortRequested()) {
+        if (M400MotionInterrupted()) {
             rc = DJI_ERROR_SYSTEM_MODULE_CODE_EXECUTING_HIGHER_PRIORITY_TASK;
             goto release;
         }
@@ -842,7 +942,7 @@ T_DjiReturnCode M400Control_YawRelative(float deltaDegree)
     bool heightFresh = false;
     const uint64_t heightWaitStartMs = M400GetMonotonicMs();
     while (M400GetMonotonicMs() - heightWaitStartMs < M400_POSITION_STALE_MS) {
-        if (M400AbortRequested()) {
+        if (M400MotionInterrupted()) {
             rc = DJI_ERROR_SYSTEM_MODULE_CODE_EXECUTING_HIGHER_PRIORITY_TASK;
             goto release;
         }
@@ -892,7 +992,7 @@ T_DjiReturnCode M400Control_YawRelative(float deltaDegree)
     bool haveYawRate = false;
     bool finished = false;
     while (M400GetMonotonicMs() - startMs < M400_YAW_TIMEOUT_MS) {
-        if (M400AbortRequested()) {
+        if (M400MotionInterrupted()) {
             rc = DJI_ERROR_SYSTEM_MODULE_CODE_EXECUTING_HIGHER_PRIORITY_TASK;
             break;
         }
@@ -958,7 +1058,7 @@ T_DjiReturnCode M400Control_YawRelative(float deltaDegree)
     }
     if (rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
         for (unsigned int elapsed = 0; elapsed < 500; elapsed += M400_CONTROL_PERIOD_MS) {
-            if (M400AbortRequested()) {
+            if (M400MotionInterrupted()) {
                 rc = DJI_ERROR_SYSTEM_MODULE_CODE_EXECUTING_HIGHER_PRIORITY_TASK;
                 break;
             }
@@ -972,13 +1072,19 @@ T_DjiReturnCode M400Control_YawRelative(float deltaDegree)
 release:
     // A failure or emergency may need a prompt brake. Normal completion leaves
     // the controller in position/zero-yaw-rate mode until authority is released.
-    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+    if (M400AuthorityRevoked() && rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS)
+        rc = DJI_ERROR_SYSTEM_MODULE_CODE_EXECUTING_HIGHER_PRIORITY_TASK;
+    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS && !M400AuthorityRevoked()) {
         (void) M400SendStableZero(500);
     }
-    T_DjiReturnCode releaseRc = DjiFlightController_ReleaseJoystickCtrlAuthority();
+    T_DjiReturnCode releaseRc = M400AuthorityRevoked() ? DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS :
+                                DjiFlightController_ReleaseJoystickCtrlAuthority();
     if (rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) rc = releaseRc;
     if (rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
         M400SetResult("YAW %+.0fdeg: OK", deltaDegree);
+    } else if (M400AuthorityRevoked()) {
+        M400SetResult("YAW stopped: RC took control (event %d)",
+                      __atomic_load_n(&s_authorityLossReason, __ATOMIC_ACQUIRE));
     } else if (M400AbortRequested()) {
         M400SetResult("YAW interrupted by emergency hover");
     } else {
@@ -1008,7 +1114,7 @@ static float M400ClampPositionAxis(double valueM, float limitM)
     return (float) fmax(-limitM, fmin(limitM, valueM));
 }
 
-static T_DjiReturnCode M400RunGotoCoordinate(const T_M400GotoTarget *target, bool officialStyle,
+static T_DjiReturnCode M400RunGotoCoordinate(const T_M400GotoTarget *target,
                                             float horizontalLimitM)
 {
     if (!isfinite(horizontalLimitM) || horizontalLimitM < 0.0f ||
@@ -1099,8 +1205,7 @@ static T_DjiReturnCode M400RunGotoCoordinate(const T_M400GotoTarget *target, boo
     const T_DjiFlightControllerJoystickMode mode = {
         DJI_FLIGHT_CONTROLLER_HORIZONTAL_POSITION_CONTROL_MODE,
         DJI_FLIGHT_CONTROLLER_VERTICAL_POSITION_CONTROL_MODE,
-        officialStyle ? DJI_FLIGHT_CONTROLLER_YAW_ANGLE_CONTROL_MODE :
-                        DJI_FLIGHT_CONTROLLER_YAW_ANGLE_RATE_CONTROL_MODE,
+        DJI_FLIGHT_CONTROLLER_YAW_ANGLE_RATE_CONTROL_MODE,
         DJI_FLIGHT_CONTROLLER_HORIZONTAL_GROUND_COORDINATE,
         DJI_FLIGHT_CONTROLLER_STABLE_CONTROL_MODE_ENABLE,
     };
@@ -1118,13 +1223,12 @@ static T_DjiReturnCode M400RunGotoCoordinate(const T_M400GotoTarget *target, boo
     float previousYaw = M400CurrentYawDegree(&quaternion);
     float filteredYawRateDegS = 0.0f;
     bool haveYawRate = false, finished = false;
-    int stage = officialStyle ? 3 : 0; // 0=turn, 1=height, 2=horizontal, 3=simultaneous
+    int stage = 0; // 0=turn, 1=height, 2=horizontal
     M400SetCommandState(M400_COMMAND_STATE_RUNNING);
-    if (officialStyle) M400SetResult("Official-style goto F2: simultaneous");
-    else M400SetResult("Staged goto F%.0f 1/3: heading", horizontalLimitM);
+    M400SetResult("Staged goto F%.0f 1/3: heading", horizontalLimitM);
 
     while (M400GetMonotonicMs() - startMs < target->timeoutMs) {
-        if (M400AbortRequested()) {
+        if (M400MotionInterrupted()) {
             rc = DJI_ERROR_SYSTEM_MODULE_CODE_EXECUTING_HIGHER_PRIORITY_TASK;
             break;
         }
@@ -1199,35 +1303,25 @@ static T_DjiReturnCode M400RunGotoCoordinate(const T_M400GotoTarget *target, boo
         previousCommandMs = nowMs;
         command.x = command.y = 0.0f;
 
-        if (officialStyle) {
-            // DJI sample style: clip each position-offset axis independently.
+        command.yaw = M400NextYawRateCommand(targetYaw, measuredYaw, command.yaw, dtSec);
+        if (stage == 0) {
+            command.z = holdHeight;
+        } else if (stage == 1) {
+            const float maxStepM = M400_VERTICAL_SETPOINT_RATE_MPS * fminf(dtSec, 0.1f);
+            verticalSetpoint += fmaxf(-maxStepM,
+                                       fminf(maxStepM, target->heightAboveTakeoffM - verticalSetpoint));
+            command.z = verticalSetpoint;
+        } else {
             command.x = M400ClampPositionAxis(northM, horizontalLimitM);
             command.y = M400ClampPositionAxis(eastM, horizontalLimitM);
             command.z = target->heightAboveTakeoffM;
-            command.yaw = targetYaw;
-        } else {
-            command.yaw = M400NextYawRateCommand(targetYaw, measuredYaw, command.yaw, dtSec);
-            if (stage == 0) {
-                command.z = holdHeight;
-            } else if (stage == 1) {
-                const float maxStepM = M400_VERTICAL_SETPOINT_RATE_MPS * fminf(dtSec, 0.1f);
-                verticalSetpoint += fmaxf(-maxStepM,
-                                           fminf(maxStepM, target->heightAboveTakeoffM - verticalSetpoint));
-                command.z = verticalSetpoint;
-            } else {
-                command.x = M400ClampPositionAxis(northM, horizontalLimitM);
-                command.y = M400ClampPositionAxis(eastM, horizontalLimitM);
-                command.z = target->heightAboveTakeoffM;
-            }
         }
         rc = DjiFlightController_ExecuteJoystickAction(command);
         if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) break;
 
-        const bool yawReady = yawErrorDeg <= target->yawToleranceDeg &&
-                              (!officialStyle ?
-                               (newYaw && haveYawRate &&
-                                fabsf(filteredYawRateDegS) <= M400_YAW_RATE_TOL_DEG_S &&
-                                fabsf(command.yaw) <= 1.0f) : true);
+        const bool yawReady = yawErrorDeg <= target->yawToleranceDeg && newYaw && haveYawRate &&
+                              fabsf(filteredYawRateDegS) <= M400_YAW_RATE_TOL_DEG_S &&
+                              fabsf(command.yaw) <= 1.0f;
         bool stageReady = false;
         if (stage == 0) {
             stageReady = yawReady;
@@ -1266,31 +1360,34 @@ static T_DjiReturnCode M400RunGotoCoordinate(const T_M400GotoTarget *target, boo
         // Hold the final position and heading without a mode switch before release.
         command.x = command.y = 0.0f;
         command.z = target->heightAboveTakeoffM;
-        if (officialStyle) command.yaw = targetYaw;
         for (unsigned int elapsed = 0; elapsed < 500; elapsed += M400_CONTROL_PERIOD_MS) {
-            if (M400AbortRequested()) {
+            if (M400MotionInterrupted()) {
                 rc = DJI_ERROR_SYSTEM_MODULE_CODE_EXECUTING_HIGHER_PRIORITY_TASK;
                 break;
             }
-            if (!officialStyle) {
-                const float maxChange = M400_YAW_ACCEL_DEG_S2 * M400_CONTROL_PERIOD_MS / 1000.0f;
-                command.yaw += fmaxf(-maxChange, fminf(maxChange, -command.yaw));
-            }
+            const float maxChange = M400_YAW_ACCEL_DEG_S2 * M400_CONTROL_PERIOD_MS / 1000.0f;
+            command.yaw += fmaxf(-maxChange, fminf(maxChange, -command.yaw));
             rc = DjiFlightController_ExecuteJoystickAction(command);
             if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) break;
             usleep(M400_CONTROL_PERIOD_MS * 1000);
         }
     }
 release:
-    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) (void) M400SendStableZero(500);
-    T_DjiReturnCode releaseRc = DjiFlightController_ReleaseJoystickCtrlAuthority();
+    if (M400AuthorityRevoked() && rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS)
+        rc = DJI_ERROR_SYSTEM_MODULE_CODE_EXECUTING_HIGHER_PRIORITY_TASK;
+    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS && !M400AuthorityRevoked())
+        (void) M400SendStableZero(500);
+    T_DjiReturnCode releaseRc = M400AuthorityRevoked() ? DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS :
+                                DjiFlightController_ReleaseJoystickCtrlAuthority();
     if (rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) rc = releaseRc;
     if (rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
         M400SetCommandState(M400_COMMAND_STATE_SUCCESS);
-        if (officialStyle) M400SetResult("Official-style goto F2 arrived: horizontal error %.2fm",
-                                        lastHorizontalErrorM);
-        else M400SetResult("Staged goto F%.0f arrived: horizontal error %.2fm",
-                           horizontalLimitM, lastHorizontalErrorM);
+        M400SetResult("Staged goto F%.0f arrived: horizontal error %.2fm",
+                      horizontalLimitM, lastHorizontalErrorM);
+    } else if (M400AuthorityRevoked()) {
+        M400SetCommandState(M400_COMMAND_STATE_REJECTED);
+        M400SetResult("Goto stopped: RC took control (event %d)",
+                      __atomic_load_n(&s_authorityLossReason, __ATOMIC_ACQUIRE));
     } else if (M400AbortRequested()) {
         M400SetCommandState(M400_COMMAND_STATE_EMERGENCY);
         M400SetResult("Goto interrupted by emergency hover");
@@ -1308,21 +1405,17 @@ exit:
 
 T_DjiReturnCode M400Control_GotoCoordinate(const T_M400GotoTarget *target)
 {
-    return M400RunGotoCoordinate(target, false, M400_POSITION_COMMAND_LIMIT_M);
+    return M400RunGotoCoordinate(target, M400_POSITION_COMMAND_LIMIT_M);
 }
 
 T_DjiReturnCode M400Control_GotoCoordinateWithLimit(const T_M400GotoTarget *target,
                                                    float horizontalPositionLimitM)
 {
-    return M400RunGotoCoordinate(target, false, horizontalPositionLimitM);
+    return M400RunGotoCoordinate(target, horizontalPositionLimitM);
 }
 
-T_DjiReturnCode M400Control_GotoCoordinateOfficialDemo(const T_M400GotoTarget *target)
-{
-    return M400RunGotoCoordinate(target, true, M400_POSITION_COMMAND_LIMIT_M);
-}
-
-static T_DjiReturnCode M400BuildFixedTestTarget(T_M400GotoTarget *target, double *distanceM)
+static T_DjiReturnCode M400BuildFixedWaypointTarget(T_M400WaypointTarget *target,
+                                                     double *distanceM)
 {
     T_DjiReturnCode rc = M400CheckAircraftInAir();
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) return rc;
@@ -1330,7 +1423,7 @@ static T_DjiReturnCode M400BuildFixedTestTarget(T_M400GotoTarget *target, double
     T_DjiFcSubscriptionHeightRelative height;
     float currentYaw;
     if (!M400ReadMoveOrigin(&position, &height, &currentYaw)) {
-        M400SetResult("Fixed goto denied: positioning unavailable");
+        M400SetResult("Fixed waypoint denied: positioning unavailable");
         return DJI_ERROR_SYSTEM_MODULE_CODE_NONSUPPORT_IN_CURRENT_STATE;
     }
     double northM, eastM;
@@ -1339,20 +1432,16 @@ static T_DjiReturnCode M400BuildFixedTestTarget(T_M400GotoTarget *target, double
                        &position, &northM, &eastM);
     *distanceM = hypot(northM, eastM);
     if (*distanceM > M400_GOTO_MAX_DISTANCE_M) {
-        M400SetResult("Fixed goto denied: %.1fm exceeds 100m test limit", *distanceM);
+        M400SetResult("Fixed waypoint denied: %.1fm exceeds 100m test limit", *distanceM);
         return DJI_ERROR_SYSTEM_MODULE_CODE_INVALID_PARAMETER;
     }
     const float bearingDeg = *distanceM > 0.5 ?
                              (float) (atan2(eastM, northM) * M400_DEG_PER_RAD) : currentYaw;
-    *target = (T_M400GotoTarget) {
+    *target = (T_M400WaypointTarget) {
         .latitudeDeg = M400_TEST_LATITUDE_DEG,
         .longitudeDeg = M400_TEST_LONGITUDE_DEG,
         .heightAboveTakeoffM = M400_TEST_HEIGHT_M,
-        .yawDeg = bearingDeg,
-        .horizontalToleranceM = 0.6f,
-        .verticalToleranceM = 0.4f,
-        .yawToleranceDeg = 3.0f,
-        .timeoutMs = 120000U,
+        .finalYawDeg = bearingDeg,
     };
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
@@ -1361,6 +1450,23 @@ T_DjiReturnCode M400Control_EmergencyHover(void)
 {
     M400SetAbortRequested(true);
     pthread_mutex_lock(&s_controlMutex);
+    pthread_mutex_lock(&s_stateMutex);
+    bool waypointActive = s_waypointActive;
+    pthread_mutex_unlock(&s_stateMutex);
+    if (waypointActive) {
+        T_DjiReturnCode stopRc = DjiWaypointV3_Action(DJI_WAYPOINT_V3_ACTION_STOP);
+        if (stopRc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+            pthread_mutex_lock(&s_stateMutex);
+            s_waypointActive = false;
+            pthread_mutex_unlock(&s_stateMutex);
+            M400SetResult("Waypoint stopped; verify aircraft hover");
+        } else {
+            M400SetResult("Waypoint stop failed: 0x%08llX", (unsigned long long) stopRc);
+        }
+        M400SetAbortRequested(false);
+        pthread_mutex_unlock(&s_controlMutex);
+        return stopRc;
+    }
     T_DjiReturnCode rc = M400CheckAircraftInAir();
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
         M400SetResult("Emergency hover: aircraft already on ground");
@@ -1384,15 +1490,179 @@ T_DjiReturnCode M400Control_EmergencyHover(void)
     return rc;
 }
 
+/* Caller holds s_controlMutex. Upload/start is synchronous; the flight is asynchronous. */
+static T_DjiReturnCode M400StartWaypointMission(const T_M400WaypointKmzSpec *spec,
+                                                const char *description)
+{
+    uint8_t *kmz = NULL;
+    uint32_t kmzSize = 0;
+    if (M400WaypointKmz_Build(spec, &kmz, &kmzSize) != 0) {
+        M400SetResult("Waypoint KMZ creation failed");
+        return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
+    }
+    bool started = false;
+    T_DjiReturnCode rc = M400EnsureWaypointInitialized();
+    if (rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS && !M400AbortRequested()) {
+        rc = DjiWaypointV3_UploadKmzFile(kmz, kmzSize);
+        if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+            M400SetResult("Waypoint upload failed: 0x%08llX", (unsigned long long) rc);
+        } else if (!M400AbortRequested()) {
+            pthread_mutex_lock(&s_stateMutex);
+            s_waypointActive = true;
+            pthread_mutex_unlock(&s_stateMutex);
+            rc = DjiWaypointV3_Action(DJI_WAYPOINT_V3_ACTION_START);
+            if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+                pthread_mutex_lock(&s_stateMutex);
+                s_waypointActive = false;
+                pthread_mutex_unlock(&s_stateMutex);
+                M400SetResult("Waypoint start failed: 0x%08llX", (unsigned long long) rc);
+            } else {
+                started = true;
+                M400SetResult("%s started; H%.1f V%.1fm/s", description,
+                              spec->endHeightM, spec->cruiseSpeedMps);
+            }
+        }
+    }
+    if (!started && M400AbortRequested() && rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        M400SetResult("Waypoint cancelled before start");
+        rc = DJI_ERROR_SYSTEM_MODULE_CODE_EXECUTING_HIGHER_PRIORITY_TASK;
+    }
+    free(kmz);
+    return rc;
+}
+
+T_DjiReturnCode M400Control_RunWaypointRelative(const T_M400WaypointMove *move)
+{
+    if (move == NULL || !isfinite(move->forwardM) || !isfinite(move->leftM) ||
+        !isfinite(move->upM) || !isfinite(move->cruiseSpeedMps) ||
+        !isfinite(move->safeTakeoffHeightM) || !isfinite(move->finalYawDeg) ||
+        fabsf(move->forwardM) > 10.0f || fabsf(move->leftM) > 10.0f ||
+        fabsf(move->upM) > 10.0f || move->cruiseSpeedMps < 1.0f ||
+        move->cruiseSpeedMps > 10.0f || move->safeTakeoffHeightM < 2.0f ||
+        move->safeTakeoffHeightM > 1500.0f || fabsf(move->finalYawDeg) > 180.0f) {
+        return DJI_ERROR_SYSTEM_MODULE_CODE_INVALID_PARAMETER;
+    }
+    if (pthread_mutex_trylock(&s_controlMutex) != 0) {
+        M400SetResult("Waypoint rejected: controller busy");
+        return DJI_ERROR_SYSTEM_MODULE_CODE_BUSY;
+    }
+    pthread_mutex_lock(&s_stateMutex);
+    bool waypointActive = s_waypointActive;
+    pthread_mutex_unlock(&s_stateMutex);
+    if (waypointActive) {
+        pthread_mutex_unlock(&s_controlMutex);
+        M400SetResult("Waypoint rejected: mission already active");
+        return DJI_ERROR_SYSTEM_MODULE_CODE_BUSY;
+    }
+    T_DjiReturnCode rc = M400CheckAircraftInAir();
+    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) goto out;
+    T_DjiFcSubscriptionPositionFused position;
+    T_DjiFcSubscriptionHeightRelative height;
+    float yawDeg;
+    if (!M400ReadMoveOrigin(&position, &height, &yawDeg)) {
+        M400SetResult("Waypoint denied: position/height/heading stale");
+        rc = DJI_ERROR_SYSTEM_MODULE_CODE_NONSUPPORT_IN_CURRENT_STATE;
+        goto out;
+    }
+    const float targetHeight = height + move->upM;
+    if (targetHeight < 2.0f || targetHeight > 120.0f) {
+        M400SetResult("Waypoint denied: target height outside 2-120m test limit");
+        rc = DJI_ERROR_SYSTEM_MODULE_CODE_INVALID_PARAMETER;
+        goto out;
+    }
+    const double yawRad = (double) yawDeg / M400_DEG_PER_RAD;
+    const double northM = move->forwardM * cos(yawRad) + move->leftM * sin(yawRad);
+    const double eastM = move->forwardM * sin(yawRad) - move->leftM * cos(yawRad);
+    const double targetLatitudeRad = position.latitude + northM / M400_EARTH_RADIUS_M;
+    const double targetLongitudeRad = position.longitude +
+                                      eastM / (M400_EARTH_RADIUS_M * cos(position.latitude));
+    const T_M400WaypointKmzSpec spec = {
+        .startLatitudeDeg = position.latitude * M400_DEG_PER_RAD,
+        .startLongitudeDeg = position.longitude * M400_DEG_PER_RAD,
+        .endLatitudeDeg = targetLatitudeRad * M400_DEG_PER_RAD,
+        .endLongitudeDeg = targetLongitudeRad * M400_DEG_PER_RAD,
+        .startHeightM = height,
+        .endHeightM = targetHeight,
+        .cruiseSpeedMps = move->cruiseSpeedMps,
+        .safeTakeoffHeightM = move->safeTakeoffHeightM,
+        .endYawDeg = move->finalYawDeg,
+    };
+    rc = M400StartWaypointMission(&spec, "Relative waypoint");
+out:
+    pthread_mutex_unlock(&s_controlMutex);
+    return rc;
+}
+
+T_DjiReturnCode M400Control_RunWaypointCoordinate(const T_M400WaypointTarget *target)
+{
+    if (target == NULL || !isfinite(target->latitudeDeg) ||
+        !isfinite(target->longitudeDeg) || !isfinite(target->heightAboveTakeoffM) ||
+        !isfinite(target->cruiseSpeedMps) || !isfinite(target->safeTakeoffHeightM) ||
+        !isfinite(target->finalYawDeg) || fabs(target->latitudeDeg) > 90.0 ||
+        fabs(target->longitudeDeg) > 180.0 || target->heightAboveTakeoffM < 2.0f ||
+        target->heightAboveTakeoffM > 120.0f || target->cruiseSpeedMps < 1.0f ||
+        target->cruiseSpeedMps > 10.0f || target->safeTakeoffHeightM < 2.0f ||
+        target->safeTakeoffHeightM > 1500.0f || fabsf(target->finalYawDeg) > 180.0f) {
+        return DJI_ERROR_SYSTEM_MODULE_CODE_INVALID_PARAMETER;
+    }
+    if (pthread_mutex_trylock(&s_controlMutex) != 0) {
+        M400SetResult("Waypoint rejected: controller busy");
+        return DJI_ERROR_SYSTEM_MODULE_CODE_BUSY;
+    }
+    pthread_mutex_lock(&s_stateMutex);
+    bool waypointActive = s_waypointActive;
+    pthread_mutex_unlock(&s_stateMutex);
+    if (waypointActive) {
+        pthread_mutex_unlock(&s_controlMutex);
+        M400SetResult("Waypoint rejected: mission already active");
+        return DJI_ERROR_SYSTEM_MODULE_CODE_BUSY;
+    }
+    T_DjiReturnCode rc = M400CheckAircraftInAir();
+    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) goto out;
+    T_DjiFcSubscriptionPositionFused position;
+    T_DjiFcSubscriptionHeightRelative height;
+    float yawDeg;
+    if (!M400ReadMoveOrigin(&position, &height, &yawDeg)) {
+        M400SetResult("Waypoint denied: position/height/heading stale");
+        rc = DJI_ERROR_SYSTEM_MODULE_CODE_NONSUPPORT_IN_CURRENT_STATE;
+        goto out;
+    }
+    double northM, eastM;
+    M400OffsetToTarget(target->latitudeDeg / M400_DEG_PER_RAD,
+                       target->longitudeDeg / M400_DEG_PER_RAD,
+                       &position, &northM, &eastM);
+    double distanceM = hypot(northM, eastM);
+    if (!isfinite(distanceM) || distanceM > M400_GOTO_MAX_DISTANCE_M) {
+        M400SetResult("Waypoint denied: target beyond 100m test limit");
+        rc = DJI_ERROR_SYSTEM_MODULE_CODE_INVALID_PARAMETER;
+        goto out;
+    }
+    const T_M400WaypointKmzSpec spec = {
+        .startLatitudeDeg = position.latitude * M400_DEG_PER_RAD,
+        .startLongitudeDeg = position.longitude * M400_DEG_PER_RAD,
+        .endLatitudeDeg = target->latitudeDeg,
+        .endLongitudeDeg = target->longitudeDeg,
+        .startHeightM = height,
+        .endHeightM = target->heightAboveTakeoffM,
+        .cruiseSpeedMps = target->cruiseSpeedMps,
+        .safeTakeoffHeightM = target->safeTakeoffHeightM,
+        .endYawDeg = target->finalYawDeg,
+    };
+    rc = M400StartWaypointMission(&spec, "Fixed waypoint");
+out:
+    pthread_mutex_unlock(&s_controlMutex);
+    return rc;
+}
+
 static T_DjiReturnCode M400QueueCommand(E_M400QueuedCommand command)
 {
-    const bool fixedGoto = command == M400_COMMAND_GOTO_STAGED ||
-                           command == M400_COMMAND_GOTO_STAGED_10 ||
-                           command == M400_COMMAND_GOTO_OFFICIAL;
+    const bool fixedWaypoint = command == M400_COMMAND_WAYPOINT_FIXED_2 ||
+                               command == M400_COMMAND_WAYPOINT_FIXED_10;
     double previewDistanceM = 0.0;
-    if (fixedGoto) {
-        T_M400GotoTarget previewTarget;
-        T_DjiReturnCode previewRc = M400BuildFixedTestTarget(&previewTarget, &previewDistanceM);
+    if (fixedWaypoint) {
+        T_M400WaypointTarget previewTarget;
+        T_DjiReturnCode previewRc = M400BuildFixedWaypointTarget(&previewTarget,
+                                                                  &previewDistanceM);
         if (previewRc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) return previewRc;
     }
     pthread_mutex_lock(&s_queueMutex);
@@ -1409,20 +1679,43 @@ static T_DjiReturnCode M400QueueCommand(E_M400QueuedCommand command)
     if (s_pendingCommand != M400_COMMAND_NONE || pthread_mutex_trylock(&s_controlMutex) != 0) {
         pthread_mutex_unlock(&s_queueMutex);
         M400SetCommandState(M400_COMMAND_STATE_REJECTED);
-        M400SetResult("Command rejected: controller busy");
+        M400SetResult(M400AuthorityRevoked() ?
+                      "RC took control; previous command stopping" :
+                      "Command rejected: controller busy");
         return DJI_ERROR_SYSTEM_MODULE_CODE_BUSY;
     }
     pthread_mutex_unlock(&s_controlMutex);
-    if (fixedGoto &&
+    if (command == M400_COMMAND_WAYPOINT_RELATIVE || fixedWaypoint) {
+        pthread_mutex_lock(&s_stateMutex);
+        if (s_waypointActive) {
+            pthread_mutex_unlock(&s_stateMutex);
+            pthread_mutex_unlock(&s_queueMutex);
+            M400SetCommandState(M400_COMMAND_STATE_REJECTED);
+            M400SetResult("Waypoint rejected: mission already active");
+            return DJI_ERROR_SYSTEM_MODULE_CODE_BUSY;
+        }
+        if (command == M400_COMMAND_WAYPOINT_RELATIVE) {
+            s_pendingWaypointMove = (T_M400WaypointMove) {
+                .forwardM = s_widgetValues[M400_WIDGET_WAYPOINT_FORWARD],
+                .leftM = s_widgetValues[M400_WIDGET_WAYPOINT_LEFT],
+                .upM = s_widgetValues[M400_WIDGET_WAYPOINT_UP],
+                .cruiseSpeedMps = s_widgetValues[M400_WIDGET_WAYPOINT_SPEED],
+                .safeTakeoffHeightM = s_widgetValues[M400_WIDGET_WAYPOINT_SAFE_HEIGHT],
+                .finalYawDeg = s_widgetValues[M400_WIDGET_WAYPOINT_YAW],
+            };
+        } else {
+            s_pendingFixedSafeHeightM = s_widgetValues[M400_WIDGET_WAYPOINT_SAFE_HEIGHT];
+        }
+        pthread_mutex_unlock(&s_stateMutex);
+    }
+    if (fixedWaypoint &&
         (s_armedGotoCommand != command || M400GetMonotonicMs() > s_gotoArmUntilMs)) {
         s_armedGotoCommand = command;
-        s_gotoArmUntilMs = M400GetMonotonicMs() + M400_GOTO_CONFIRM_MS;
+        s_gotoArmUntilMs = M400GetMonotonicMs() + M400_FIXED_WAYPOINT_CONFIRM_MS;
         pthread_mutex_unlock(&s_queueMutex);
         M400SetCommandState(M400_COMMAND_STATE_IDLE);
-        M400SetResult("%s 22.6025495,113.9917210 H20, %.0fm: press again <10s",
-                      command == M400_COMMAND_GOTO_STAGED ? "STAGED F2" :
-                      command == M400_COMMAND_GOTO_STAGED_10 ? "STAGED F10" : "DEMO F2",
-                      previewDistanceM);
+        M400SetResult("Waypoint V%d to 22.6025495,113.9917210 H20, %.0fm: press again <10s",
+                      command == M400_COMMAND_WAYPOINT_FIXED_2 ? 2 : 10, previewDistanceM);
         return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
     }
     s_armedGotoCommand = M400_COMMAND_NONE;
@@ -1440,11 +1733,18 @@ static void *M400ControlTask(void *arg)
     T_DjiOsalHandler *osal = DjiPlatform_GetOsalHandler();
     while (true) {
         E_M400QueuedCommand command = M400_COMMAND_NONE;
+        T_M400WaypointMove waypointMove = {0};
+        float fixedSafeHeightM = 40.0f;
         T_DjiReturnCode commandRc = DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
         pthread_mutex_lock(&s_queueMutex);
         if (s_pendingCommand != M400_COMMAND_NONE) {
             command = s_pendingCommand;
             s_pendingCommand = M400_COMMAND_NONE;
+            if (command == M400_COMMAND_WAYPOINT_RELATIVE) waypointMove = s_pendingWaypointMove;
+            if (command == M400_COMMAND_WAYPOINT_FIXED_2 ||
+                command == M400_COMMAND_WAYPOINT_FIXED_10) {
+                fixedSafeHeightM = s_pendingFixedSafeHeightM;
+            }
         }
         pthread_mutex_unlock(&s_queueMutex);
 
@@ -1461,33 +1761,44 @@ static void *M400ControlTask(void *arg)
             case M400_COMMAND_UP: commandRc = M400Control_MoveVertical(1.0f); break;
             case M400_COMMAND_DOWN: commandRc = M400Control_MoveVertical(-1.0f); break;
             case M400_COMMAND_FORWARD_5M: commandRc = M400Control_MoveRelative(M400_MOVE_FORWARD, 5.0f); break;
-            case M400_COMMAND_GOTO_STAGED:
-            case M400_COMMAND_GOTO_STAGED_10:
-            case M400_COMMAND_GOTO_OFFICIAL: {
-                T_M400GotoTarget target;
+            case M400_COMMAND_WAYPOINT_FIXED_2:
+            case M400_COMMAND_WAYPOINT_FIXED_10: {
+                T_M400WaypointTarget target;
                 double distanceM;
-                commandRc = M400BuildFixedTestTarget(&target, &distanceM);
+                commandRc = M400BuildFixedWaypointTarget(&target, &distanceM);
                 if (commandRc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-                    commandRc = command == M400_COMMAND_GOTO_STAGED ?
-                                M400Control_GotoCoordinate(&target) :
-                                command == M400_COMMAND_GOTO_STAGED_10 ?
-                                M400Control_GotoCoordinateWithLimit(&target, M400_POSITION_COMMAND_TEST_LIMIT_M) :
-                                M400Control_GotoCoordinateOfficialDemo(&target);
+                    target.cruiseSpeedMps = command == M400_COMMAND_WAYPOINT_FIXED_2 ? 2.0f : 10.0f;
+                    target.safeTakeoffHeightM = fixedSafeHeightM;
+                    commandRc = M400Control_RunWaypointCoordinate(&target);
                 }
                 break;
             }
             case M400_COMMAND_EMERGENCY_HOVER: commandRc = M400Control_EmergencyHover(); break;
+            case M400_COMMAND_WAYPOINT_RELATIVE:
+                commandRc = M400Control_RunWaypointRelative(&waypointMove);
+                break;
             default: break;
         }
         if (command == M400_COMMAND_EMERGENCY_HOVER) {
             M400SetCommandState(commandRc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS ?
                                M400_COMMAND_STATE_EMERGENCY : M400_COMMAND_STATE_FAILED);
         } else if (command != M400_COMMAND_NONE) {
-            if (commandRc == DJI_ERROR_SYSTEM_MODULE_CODE_EXECUTING_HIGHER_PRIORITY_TASK &&
-                M400AbortRequested()) {
+            if (M400AuthorityRevoked()) {
+                M400SetCommandState(M400_COMMAND_STATE_REJECTED);
+            } else if (commandRc == DJI_ERROR_SYSTEM_MODULE_CODE_EXECUTING_HIGHER_PRIORITY_TASK &&
+                       M400AbortRequested()) {
                 M400SetCommandState(M400_COMMAND_STATE_EMERGENCY);
             } else if (commandRc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-                M400SetCommandState(M400_COMMAND_STATE_SUCCESS);
+                if (command == M400_COMMAND_WAYPOINT_RELATIVE ||
+                    command == M400_COMMAND_WAYPOINT_FIXED_2 ||
+                    command == M400_COMMAND_WAYPOINT_FIXED_10) {
+                    pthread_mutex_lock(&s_stateMutex);
+                    bool stillActive = s_waypointActive;
+                    pthread_mutex_unlock(&s_stateMutex);
+                    M400SetCommandState(stillActive ? M400_COMMAND_STATE_RUNNING : M400_COMMAND_STATE_IDLE);
+                } else {
+                    M400SetCommandState(M400_COMMAND_STATE_SUCCESS);
+                }
             } else if (commandRc == DJI_ERROR_SYSTEM_MODULE_CODE_NONSUPPORT_IN_CURRENT_STATE ||
                        commandRc == DJI_ERROR_SYSTEM_MODULE_CODE_BUSY) {
                 M400SetCommandState(M400_COMMAND_STATE_REJECTED);
@@ -1586,7 +1897,20 @@ static T_DjiReturnCode M400WidgetSetValue(E_DjiWidgetType widgetType, uint32_t i
         index == M400_WIDGET_COMMAND_STATE || index == M400_WIDGET_CSV_DATE || index == M400_WIDGET_CSV_TIME) {
         return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
     }
+    if (index >= M400_WIDGET_WAYPOINT_FORWARD && index <= M400_WIDGET_WAYPOINT_YAW) {
+        int32_t low = -10, high = 10;
+        if (index == M400_WIDGET_WAYPOINT_SPEED) { low = 1; high = 10; }
+        if (index == M400_WIDGET_WAYPOINT_SAFE_HEIGHT) { low = 2; high = 1500; }
+        if (index == M400_WIDGET_WAYPOINT_YAW) { low = -180; high = 180; }
+        if (value < low || value > high) {
+            M400SetResult("Waypoint input rejected: index %u outside [%d,%d]",
+                          (unsigned int) index, low, high);
+            return DJI_ERROR_SYSTEM_MODULE_CODE_INVALID_PARAMETER;
+        }
+    }
+    pthread_mutex_lock(&s_stateMutex);
     s_widgetValues[index] = value;
+    pthread_mutex_unlock(&s_stateMutex);
     if (widgetType == DJI_WIDGET_TYPE_BUTTON && value != DJI_WIDGET_BUTTON_STATE_PRESS_DOWN) {
         return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
     }
@@ -1619,19 +1943,17 @@ static T_DjiReturnCode M400WidgetSetValue(E_DjiWidgetType widgetType, uint32_t i
             }
             pthread_mutex_unlock(&s_stateMutex);
             return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
-        case M400_WIDGET_FORWARD_1M: return M400QueueCommand(M400_COMMAND_FORWARD);
-        case M400_WIDGET_BACKWARD_1M: return M400QueueCommand(M400_COMMAND_BACKWARD);
-        case M400_WIDGET_LEFT_1M: return M400QueueCommand(M400_COMMAND_LEFT);
-        case M400_WIDGET_RIGHT_1M: return M400QueueCommand(M400_COMMAND_RIGHT);
         case M400_WIDGET_EMERGENCY_HOVER: return M400QueueCommand(M400_COMMAND_EMERGENCY_HOVER);
-        case M400_WIDGET_YAW_LEFT: return M400QueueCommand(M400_COMMAND_YAW_LEFT);
-        case M400_WIDGET_YAW_RIGHT: return M400QueueCommand(M400_COMMAND_YAW_RIGHT);
-        case M400_WIDGET_UP_1M: return M400QueueCommand(M400_COMMAND_UP);
-        case M400_WIDGET_DOWN_1M: return M400QueueCommand(M400_COMMAND_DOWN);
-        case M400_WIDGET_FORWARD_5M: return M400QueueCommand(M400_COMMAND_FORWARD_5M);
-        case M400_WIDGET_GOTO_STAGED_2: return M400QueueCommand(M400_COMMAND_GOTO_STAGED);
-        case M400_WIDGET_GOTO_OFFICIAL_2: return M400QueueCommand(M400_COMMAND_GOTO_OFFICIAL);
-        case M400_WIDGET_GOTO_STAGED_10: return M400QueueCommand(M400_COMMAND_GOTO_STAGED_10);
+        case M400_WIDGET_WAYPOINT_EXECUTE: return M400QueueCommand(M400_COMMAND_WAYPOINT_RELATIVE);
+        case M400_WIDGET_WAYPOINT_FIXED_2: return M400QueueCommand(M400_COMMAND_WAYPOINT_FIXED_2);
+        case M400_WIDGET_WAYPOINT_FIXED_10: return M400QueueCommand(M400_COMMAND_WAYPOINT_FIXED_10);
+        case M400_WIDGET_WAYPOINT_FORWARD:
+        case M400_WIDGET_WAYPOINT_LEFT:
+        case M400_WIDGET_WAYPOINT_UP:
+        case M400_WIDGET_WAYPOINT_SPEED:
+        case M400_WIDGET_WAYPOINT_SAFE_HEIGHT:
+        case M400_WIDGET_WAYPOINT_YAW:
+            return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
         case M400_WIDGET_RECORD_SWITCH:
             return value == DJI_WIDGET_SWITCH_STATE_ON ?
                    M400Control_StartRecording() : M400Control_StopRecording();
@@ -1648,10 +1970,8 @@ static T_DjiReturnCode M400WidgetGetValue(E_DjiWidgetType widgetType, uint32_t i
     }
     if (widgetType == DJI_WIDGET_TYPE_BUTTON &&
         (index == M400_WIDGET_START_RECORD || index == M400_WIDGET_STOP_RECORD ||
-         index == M400_WIDGET_EMERGENCY_HOVER || index == M400_WIDGET_UP_1M ||
-         index == M400_WIDGET_DOWN_1M || index == M400_WIDGET_FORWARD_5M ||
-         index == M400_WIDGET_GOTO_STAGED_2 || index == M400_WIDGET_GOTO_STAGED_10 ||
-         index == M400_WIDGET_GOTO_OFFICIAL_2)) {
+         index == M400_WIDGET_EMERGENCY_HOVER || index == M400_WIDGET_WAYPOINT_EXECUTE ||
+         index == M400_WIDGET_WAYPOINT_FIXED_2 || index == M400_WIDGET_WAYPOINT_FIXED_10)) {
         bool recording;
         uint64_t feedbackUntilMs;
         pthread_mutex_lock(&s_stateMutex);
@@ -1711,7 +2031,9 @@ static T_DjiReturnCode M400WidgetGetValue(E_DjiWidgetType widgetType, uint32_t i
             return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
         }
     }
+    pthread_mutex_lock(&s_stateMutex);
     *value = s_widgetValues[index];
+    pthread_mutex_unlock(&s_stateMutex);
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 

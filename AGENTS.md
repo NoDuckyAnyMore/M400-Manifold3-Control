@@ -5,9 +5,9 @@
 ## 仓库约定与路径
 
 - 唯一编辑目录：`D:\M400-Manifold3-Control`；不要回到旧的 `D:\Payload-SDK-Rndis-Simplify-Manifold3` 或临时 public/upstream 副本改项目。
-- 改代码默认保持应用版本 **1.3**（DPK `01.03.00.00`），只有用户明确要求才改版本；若改版本，同步本机 `app.json` 和 `application.cpp` 的 `firmwareVersion`。Widget JSON 的 `version: 1.0` 是独立配置版本。
+- 改代码默认保持应用版本 **1.4**（DPK `01.04.00.00`），只有用户明确要求才改版本；若改版本，同步本机 `app.json` 和 `application.cpp` 的 `firmwareVersion`。Widget JSON 的 `version: 1.0` 是独立配置版本。
 - App ID、App Key、高级 License 只保存在未跟踪的 `samples/sample_c++/platform/linux/manifold3/application/dji_sdk_app_info.h` 与 `samples/sample_c/platform/linux/manifold3/app_json/app.json`。公开前检查 `git status`、暂存差异，不能提交凭据、DPK 或飞行 CSV。
-- 修改和部署分开：除非用户明确要求，不自动传输、编译、安装、启动、提交或推送。用户在 `tools/main.m` 等文件中的现有修改应保留。
+- 修改和部署分开：除非用户明确要求，不自动传输、编译、安装、启动、提交或推送。用户在 `tools/main_scan.m`、`tools/main_scan_rotate.m` 等文件中的现有修改应保留。
 
 | 内容 | 位置 |
 | --- | --- |
@@ -15,7 +15,7 @@
 | M3 飞控、CSV、Widget 回调 | `samples/sample_c/module_sample/m400_control/m400_control_service.c/.h` |
 | M3 ↔ Pi4 TCP 模块 | `samples/sample_c/module_sample/m400_control/m400_pi4_bridge.c/.h` |
 | Pi4 通信 API / 终端 | `tools/m400_pi4_client.py` / `tools/pi4_console.py` |
-| MATLAB 航线入口 / 生成器 | `tools/main.m` / `tools/generate_m400_scan_kmz.m` |
+| MATLAB 航线入口 / 生成器 | `tools/main_scan.m`、`tools/main_scan_rotate.m` / `tools/generate_m400_scan_kmz.m`、`tools/generate_m400_scan_rotate_kmz.m` |
 | Pilot 中英文配置 | `samples/sample_c/platform/linux/manifold3/app_json/widget/{cn_big_screen,en_big_screen}/widget_config.json` |
 | M3 上源码 | `/home/dji/m400-src-v07`（历史目录名，源码可持续覆盖更新） |
 | M3 原生编译输出 / 打包暂存程序 | `/home/dji/m400-src-v07/build-manifold3-ui/bin/dji_sdk_demo_on_manifold3_cxx` / `/home/dji/m400-src-v07/build-manifold3/bin/dji_sdk_demo_on_manifold3_cxx` |
@@ -35,6 +35,7 @@ $pi = 'pi4@192.168.124.14'
 $m3 = 'dji@10.88.77.54'
 scp -J $pi 'samples/sample_c/module_sample/m400_control/m400_control_service.c' "${m3}:/home/dji/m400-src-v07/samples/sample_c/module_sample/m400_control/"
 # 如果修改了通信模块，也分别上传 m400_pi4_bridge.c 和 m400_pi4_bridge.h 到同一目录。
+# 两点航线功能还须上传 m400_waypoint_kmz.c/.h 和 m400_control_service.h；新增 .c 后重新运行 cmake 配置以更新 GLOB 源文件列表。
 # 如果修改了控件，上传中英文 widget_config.json 到 M3 源码中的对应目录。
 # 仅明确改版本时，才上传本机 app.json 与 application.cpp。
 ssh -J $pi $m3
@@ -103,9 +104,11 @@ ping -c 3 10.88.77.1
 
 ## MATLAB 航线生成
 
-航线规划不需重打 DPK。运行 `tools/main.m`；在文件开头设置高度层、扫描间距、方向和扫描速度。首次无已保存区域时可在地图上顺时针点选，以后默认复用；仅 `updateRegion=true` 才重新点选，也可手填 `regionLatLon`。输出在 `tools/waypoint_output/`：KMZ、地图叠加 `*_map2d.png`（首层箭头）和分层 `*_route3d.png`（层内和跨层方向箭头）。KMZ 使用 `followWayline` 航向模式，预计机头跟随当前航段；实际 M400 Pilot 导入和飞行行为尚未现场确认。
+航线规划不需重打 DPK。普通扫描运行 `tools/main_scan.m`；定距停转 360° 运行 `tools/main_scan_rotate.m`，并在文件开头设置 `rotationSpacingM`。两者均可设置高度层、扫描间距、方向和速度。首次无已保存区域时可在地图上顺时针点选，以后默认复用；仅 `updateRegion=true` 才重新点选，也可手填 `regionLatLon`。输出在 `tools/waypoint_output/`：KMZ、地图叠加 `*_map2d.png` 和分层 `*_route3d.png`；紫色星标为停转点。停转间距在每个高度层重新累计，层间爬升不计入。`rotateYaw` 为绝对航向角，生成器以四个连续 90° 目标角表示一圈；WPML 未给出该动作的角速度／加速度字段，M400 Pilot 对动作的导入和实飞平顺性尚未验证。
 
 任务默认：M400、相对起飞点高度、安全飞往首航点、结束返航、失控退出并返航、安全起飞 40 m、全局航线过渡速度 10 m/s、返航高度 50 m、无负载动作。扫描速度与全局过渡速度分开配置。导入前在 Pilot 2 中预览航线、高度、机型和动作。
+
+应用内的“执行两点直线航线”与 MATLAB 扫描航线不同：仅已起飞时执行，从实时融合位置生成两点 WPML KMZ，结束动作为 `noAction`；安全起飞高度在此场景不生效。Waypoint 3 上传／启动只表示任务已接受，不等于飞行及终点偏航动作已完成；需核对 Pilot 与实际航迹。普通 scan 预期应改为协调转弯，而当前生成器仍把所有航点写为“直线到点停”；不要把现有输出误认为已是协调转弯。
 
 ## 踩坑与排错
 
@@ -115,5 +118,7 @@ ping -c 3 10.88.77.1
 - `dji_app_ctl status` 曾把版本字段反序显示；版本以 `dji_app_ctl list`、本机 `app.json` 和 DPK 文件名交叉核对。同版本安装拒绝先看错误日志，不自动升版。
 - 打包脚本若报 `$'\r'`，在 M3 源码中运行 `sed -i 's/\r$//' tools/build_dpk/build_dpk.sh`。异常退出看 `journalctl -u m400-control-test.service -n 100 --no-pager`；安装失败看 `/blackbox/system/app_temp_files/m400-control-test_*.log`。
 - Pi4 文本/控件事件是展示与通知链路，不是远程飞控 API：`BUTTON` 表示按下，不保证动作完成；当前单订阅者，断线事件不补发。若 Pi4 没开机，M3 监听线程独立重试，不会阻塞飞控工作线程。
+- 遥控器暂停会收回 PSDK Joystick 控制权。控制程序订阅授权切换事件并退出当前循环；再次点按钮需重新申请控制权，飞控若拒绝不能靠软件强制抢回。历史版本未订阅此事件，暂停后可能长时间显示 `controller busy`。官方例程风格定点 F2 因实飞过于突兀已从本项目应用逻辑移除；上游 PSDK 示例保留。
+- 2026-09-28 用户实飞反馈：自定义水平与旋转动作平稳；F10 比 F2 快，但侧风下终点纠偏会导致航迹不直。现有 Joystick 位置控制只追终点，严格直线需横向误差反馈与实飞整定；WPML 航线的 `useStraightLine=1` 也只是尽量贴线。旧低高度航线已能启动并飞向首航点，但未完整执行，不能据此确认新停转动作的 M400 兼容性。
 
 参考：[DJI 妙算运行例程](https://developer.dji.com/doc/payload-sdk-tutorial/cn/manifold-quick-start/run-sample-code.html) · [DJI 妙算网络工具](https://developer.dji.com/doc/payload-sdk-tutorial/cn/manifold-quick-start/manifold-platform-capabilities/system-tools.html) · [DJI 飞控接口](https://developer.dji.com/doc/payload-sdk-tutorial/cn/function-overview/advanced-function/flight-control.html)

@@ -21,6 +21,7 @@ defaults.heightsM = [];              % 必填，如 [20 30 40]；相对起飞点
 defaults.scanSpacingM = NaN;         % 必填，平行扫描线间距，米
 defaults.directionDeg = NaN;         % 必填，扫描线航向：0=南北，90=东西，顺时针自北
 defaults.flightSpeedMps = NaN;       % 必填，航线速度，WPML 范围 1~15 m/s
+defaults.rotationSpacingM = 0;       % 0=普通扫描；正数=每层沿路径定距停下旋转 360 度
 defaults.globalTransitionalSpeedMps = 10; % 飞往首航点等航线过渡速度，m/s；与扫描速度分开
 defaults.takeoffSecurityHeightM = 40; % 安全起飞高度，相对起飞点，米
 defaults.rthHeightM = 50;           % 返航高度，相对起飞点，米
@@ -83,22 +84,42 @@ if size(basePath,1) < 2, error('无法在该区域生成至少两个航点。');
 pathENU = zeros(0,2);
 pathHeight = zeros(0,1);
 layerIndex = zeros(0,1);
+rotationFlags = false(0,1);
 for layer = 1:numel(cfg.heightsM)
     layerPath = basePath;
     if mod(layer,2) == 0, layerPath = flipud(layerPath); end
+    layerRotationFlags = false(size(layerPath,1),1);
+    if cfg.rotationSpacingM > 0
+        [layerPath,layerRotationFlags] = insertRotationStops(layerPath,cfg.rotationSpacingM);
+    end
     pathENU = [pathENU; layerPath]; %#ok<AGROW>
     pathHeight = [pathHeight; repmat(cfg.heightsM(layer),size(layerPath,1),1)]; %#ok<AGROW>
     layerIndex = [layerIndex; repmat(layer,size(layerPath,1),1)]; %#ok<AGROW>
+    rotationFlags = [rotationFlags; layerRotationFlags]; %#ok<AGROW>
 end
 if size(pathENU,1) > 65535, error('总航点数超过 WPML 的 65535 上限。'); end
+if cfg.rotationSpacingM > 0 && ~any(rotationFlags)
+    error('航线短于停转间距，未生成停转点；请减小 rotationSpacingM。');
+end
 pathLatLon = enuToLL(pathENU, geo);
+rotationHeadingsDeg = zeros(size(rotationFlags));
+for i = find(rotationFlags(:))'
+    previous = i-1;
+    while previous > 1 && norm(pathENU(i,:)-pathENU(previous,:)) < 1e-6
+        previous = previous-1;
+    end
+    stepEN = pathENU(i,:) - pathENU(previous,:);
+    if norm(stepEN) < 1e-6, error('停转点前缺少可确定航向的航段。'); end
+    rotationHeadingsDeg(i) = atan2d(stepEN(1),stepEN(2));
+end
 
 if ~isfolder(cfg.outputDir), mkdir(cfg.outputDir); end
 kmzPath = fullfile(cfg.outputDir, [cfg.outputName '.kmz']);
 if isfile(kmzPath), error('目标 KMZ 已存在，避免覆盖：%s', kmzPath); end
 previewPaths = struct('map2D','','route3D','');
 if cfg.showPreview
-    [fig2D,fig3D] = previewRoute(regionLatLon, pathLatLon, pathENU, pathHeight, layerIndex, geo, cfg);
+    [fig2D,fig3D] = previewRoute(regionLatLon, pathLatLon, pathENU, pathHeight, ...
+        layerIndex, rotationFlags, geo, cfg);
     if cfg.savePreviewImages
         previewPaths.map2D = fullfile(cfg.outputDir,[cfg.outputName '_map2d.png']);
         previewPaths.route3D = fullfile(cfg.outputDir,[cfg.outputName '_route3d.png']);
@@ -115,8 +136,8 @@ mkdir(fullfile(stageRoot, 'wpmz'));
 stageCleanup = onCleanup(@() removeStage(stageRoot));
 templatePath = fullfile(stageRoot, 'wpmz', 'template.kml');
 waylinesPath = fullfile(stageRoot, 'wpmz', 'waylines.wpml');
-writeWpml(templatePath, cfg, pathLatLon, pathHeight, false);
-writeWpml(waylinesPath, cfg, pathLatLon, pathHeight, true);
+writeWpml(templatePath, cfg, pathLatLon, pathHeight, rotationFlags, rotationHeadingsDeg, false);
+writeWpml(waylinesPath, cfg, pathLatLon, pathHeight, rotationFlags, rotationHeadingsDeg, true);
 zipPath = fullfile(stageRoot, [cfg.outputName '.zip']);
 zip(zipPath, {'wpmz/template.kml','wpmz/waylines.wpml'}, stageRoot);
 movefile(zipPath, kmzPath);
@@ -125,7 +146,9 @@ clear stageCleanup;
 result = struct('kmzPath',kmzPath,'waypointCount',size(pathLatLon,1), ...
     'layerCount',numel(cfg.heightsM),'regionLatLon',regionLatLon, ...
     'waypointLatLon',pathLatLon,'waypointHeightM',pathHeight, ...
-    'layerIndex',layerIndex,'previewPaths',previewPaths);
+    'layerIndex',layerIndex,'rotationIndices',find(rotationFlags), ...
+    'rotationLatLon',pathLatLon(rotationFlags,:),'rotationHeightM',pathHeight(rotationFlags), ...
+    'previewPaths',previewPaths);
 fprintf('已生成 %s：%d 个航点，%d 个高度层。先在 Pilot 2 导入预览，勿直接起飞。\n', ...
     kmzPath, result.waypointCount, result.layerCount);
 end
@@ -164,6 +187,7 @@ checkScalar(c.globalTransitionalSpeedMps,'globalTransitionalSpeedMps',1,15);
 checkScalar(c.takeoffSecurityHeightM,'takeoffSecurityHeightM',1.2,1500);
 checkScalar(c.rthHeightM,'rthHeightM',1.2,1500);
 checkScalar(c.edgeInsetM,'edgeInsetM',0,Inf);
+checkScalar(c.rotationSpacingM,'rotationSpacingM',0,Inf);
 if ~ismember(c.finishAction,{'goHome','noAction','autoLand','gotoFirstWaypoint'})
     error('finishAction 不属于 WPML 允许值。');
 end
@@ -253,6 +277,35 @@ end
 if isempty(path), error('扫描间距过大或区域过窄，未生成航线。'); end
 end
 
+function [expanded,stopFlags] = insertRotationStops(path,spacingM)
+% 每层按累计水平航程插点；层间爬升不计入停转间距。
+segmentM = vecnorm(diff(path),2,2);
+totalM = sum(segmentM);
+if floor(totalM/spacingM) > 65535
+    error('停转间距过小，航点数将超过 WPML 上限。');
+end
+expanded = path(1,:);
+stopFlags = false(1,1);
+targetM = spacingM;
+travelledM = 0;
+for i = 1:numel(segmentM)
+    nextM = travelledM + segmentM(i);
+    while targetM < nextM-1e-6 && targetM < totalM-1e-6
+        fraction = (targetM-travelledM)/segmentM(i);
+        expanded(end+1,:) = path(i,:) + fraction*(path(i+1,:)-path(i,:)); %#ok<AGROW>
+        stopFlags(end+1,1) = true; %#ok<AGROW>
+        targetM = targetM + spacingM;
+    end
+    expanded(end+1,:) = path(i+1,:); %#ok<AGROW>
+    stopFlags(end+1,1) = false; %#ok<AGROW>
+    if abs(targetM-nextM) <= 1e-6 && targetM < totalM-1e-6
+        stopFlags(end) = true;
+        targetM = targetM + spacingM;
+    end
+    travelledM = nextM;
+end
+end
+
 function route = insideConnector(p,q,poly)
 if norm(p-q)<0.01, route=[p;q]; return; end
 if segmentInside(p,q,poly), route=[p;q]; return; end
@@ -333,7 +386,7 @@ function z = cross2(a,b)
 z=a(1)*b(2)-a(2)*b(1);
 end
 
-function [fig2D,fig3D] = previewRoute(regionLL,routeLL,routeEN,heights,layers,geo,cfg)
+function [fig2D,fig3D] = previewRoute(regionLL,routeLL,routeEN,heights,layers,rotationFlags,geo,cfg)
 fig2D=figure('Name','M400 多高度层扫描航线（二维）','NumberTitle','off');
 gx=geoaxes;
 geobasemap(gx,cfg.mapBasemap);
@@ -355,7 +408,11 @@ for k=1:max(layers)
 end
 geoplot(gx,routeLL(1,1),routeLL(1,2),'go','MarkerFaceColor','g');
 geoplot(gx,routeLL(end,1),routeLL(end,2),'rs','MarkerFaceColor','r');
-title(gx,'二维预览：黄箭头=首层方向；其他层看三维图');
+if any(rotationFlags)
+    geoplot(gx,routeLL(rotationFlags,1),routeLL(rotationFlags,2),'mp', ...
+        'MarkerFaceColor','m','MarkerSize',8);
+end
+title(gx,'二维预览：黄箭头=首层方向；紫色星标=停转点');
 fig3D=figure('Name','M400 多高度层扫描航线（三维）','NumberTitle','off');
 hold on;
 for k=1:max(layers)
@@ -382,6 +439,10 @@ plot3(routeEN(1,1),routeEN(1,2),heights(1),'go', ...
     'MarkerFaceColor','g','DisplayName','起点');
 plot3(routeEN(end,1),routeEN(end,2),heights(end),'rs', ...
     'MarkerFaceColor','r','DisplayName','终点');
+if any(rotationFlags)
+    plot3(routeEN(rotationFlags,1),routeEN(rotationFlags,2),heights(rotationFlags),'mp', ...
+        'MarkerFaceColor','m','MarkerSize',9,'DisplayName','停转 360°');
+end
 grid on; axis equal; xlabel('东 / m'); ylabel('北 / m');
 zlabel('相对起飞点高度 / m'); title('三维航点顺序：箭头=飞行方向');
 view(35,25); legend('Location','northeastoutside');
@@ -411,7 +472,7 @@ for i=segments(:)'
 end
 end
 
-function writeWpml(path,cfg,ll,h,executable)
+function writeWpml(path,cfg,ll,h,rotationFlags,rotationHeadingsDeg,executable)
 fid=fopen(path,'w','n','UTF-8');
 if fid<0, error('无法写入 XML：%s',path); end
 guard=onCleanup(@() fclose(fid));
@@ -492,10 +553,37 @@ for i=1:size(ll,1)
         tag(fid,8,'useGlobalTurnParam','1');
         tag(fid,8,'useStraightLine','1');
     end
+    if rotationFlags(i)
+        writeSpinActionGroup(fid,i-1,rotationHeadingsDeg(i));
+    end
     fprintf(fid,'      </Placemark>\n');
 end
 fprintf(fid,'    </Folder>\n  </Document>\n</kml>\n');
 clear guard;
+end
+
+function writeSpinActionGroup(fid,waypointIndex,headingDeg)
+% rotateYaw 接收绝对航向 [-180,180]，不能直接写相对 +360。
+% 四个连续的 90 度目标角组成一圈；从入段航向开始，最终回到入段航向。
+fprintf(fid,'        <wpml:actionGroup>\n');
+tag(fid,10,'actionGroupId',sprintf('%d',waypointIndex));
+tag(fid,10,'actionGroupStartIndex',sprintf('%d',waypointIndex));
+tag(fid,10,'actionGroupEndIndex',sprintf('%d',waypointIndex));
+tag(fid,10,'actionGroupMode','sequence');
+fprintf(fid,'          <wpml:actionTrigger>\n');
+tag(fid,12,'actionTriggerType','reachPoint');
+fprintf(fid,'          </wpml:actionTrigger>\n');
+for k=1:4
+    fprintf(fid,'          <wpml:action>\n');
+    tag(fid,12,'actionId',sprintf('%d',k-1));
+    tag(fid,12,'actionActuatorFunc','rotateYaw');
+    fprintf(fid,'            <wpml:actionActuatorFuncParam>\n');
+    targetDeg = mod(headingDeg+90*k+180,360)-180;
+    tag(fid,14,'aircraftHeading',num(targetDeg));
+    fprintf(fid,'            </wpml:actionActuatorFuncParam>\n');
+    fprintf(fid,'          </wpml:action>\n');
+end
+fprintf(fid,'        </wpml:actionGroup>\n');
 end
 
 function writeHeading(fid,indent)

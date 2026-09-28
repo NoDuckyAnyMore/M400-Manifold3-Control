@@ -31,6 +31,26 @@ typedef struct {
     uint32_t timeoutMs;
 } T_M400GotoTarget;
 
+/** Waypoint 3 two-point move. Signed offsets are in the aircraft body frame at button press. */
+typedef struct {
+    float forwardM;             /* positive forward, [-10, 10] */
+    float leftM;                /* positive left, [-10, 10] */
+    float upM;                  /* positive up, [-10, 10] */
+    float cruiseSpeedMps;      /* [1, 10] */
+    float safeTakeoffHeightM;  /* WPML safe takeoff height; ignored when already airborne */
+    float finalYawDeg;         /* absolute heading from north, [-180, 180] */
+} T_M400WaypointMove;
+
+/** Absolute WGS-84 destination for a two-point Waypoint 3 mission. */
+typedef struct {
+    double latitudeDeg;
+    double longitudeDeg;
+    float heightAboveTakeoffM;
+    float cruiseSpeedMps;      /* [1, 10] */
+    float safeTakeoffHeightM;  /* Required WPML field; ignored when already airborne */
+    float finalYawDeg;         /* absolute heading from north, [-180, 180] */
+} T_M400WaypointTarget;
+
 /** Register the DJI Pilot widget. Call before DjiCore_ApplicationStart(). */
 T_DjiReturnCode M400ControlWidget_Init(void);
 
@@ -62,8 +82,10 @@ T_DjiReturnCode M400Control_GotoCoordinate(const T_M400GotoTarget *target);
 /** Staged goto with a per-axis horizontal position-offset cap in metres (0 = no clip, max 10). */
 T_DjiReturnCode M400Control_GotoCoordinateWithLimit(const T_M400GotoTarget *target,
                                                    float horizontalPositionLimitM);
-/** Official-example-style simultaneous position/height/yaw-angle controller. */
-T_DjiReturnCode M400Control_GotoCoordinateOfficialDemo(const T_M400GotoTarget *target);
+/** Builds a two-point WPML KMZ in memory, uploads it and starts Waypoint 3 asynchronously. */
+T_DjiReturnCode M400Control_RunWaypointRelative(const T_M400WaypointMove *move);
+/** Builds and starts a two-point mission to a WGS-84 target, within 100 m of current position. */
+T_DjiReturnCode M400Control_RunWaypointCoordinate(const T_M400WaypointTarget *target);
 T_DjiReturnCode M400Control_EmergencyHover(void);
 
 #ifdef __cplusplus

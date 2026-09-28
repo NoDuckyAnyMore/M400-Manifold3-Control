@@ -185,7 +185,7 @@ void Application::DjiUser_ApplicationStart()
     T_DjiAircraftInfoBaseInfo aircraftInfoBaseInfo;
     T_DjiFirmwareVersion firmwareVersion = {
         .majorVersion = 1,
-        .minorVersion = 3,
+        .minorVersion = 4,
         .modifyVersion = 0,
         .debugVersion = 0,
     };
